@@ -16,8 +16,11 @@ from pathlib import Path
 from typing import Optional
 
 
-_RTT_SRC_FILES = ["SEGGER_RTT.c", "SEGGER_RTT_printf.c"]
+_RTT_SRC_FILES = ["SEGGER_RTT.c", "SEGGER_RTT_printf.c", "rtt_heartbeat_template.c"]
 _RTT_INC_FILES = ["SEGGER_RTT.h", "SEGGER_RTT_Conf.h"]
+# 复制到项目时 rtt_heartbeat_template.c 重命名为 rtt_heartbeat.c
+_RTT_HEARTBEAT_SRC = "rtt_heartbeat_template.c"
+_RTT_HEARTBEAT_DST = "rtt_heartbeat.c"
 _ALL_RTT_FILES = _RTT_SRC_FILES + _RTT_INC_FILES
 
 
@@ -85,7 +88,9 @@ def integrate_rtt_sources(src_dir: str, inc_dir: str) -> dict:
     errors = []
 
     for fname in _RTT_SRC_FILES:
-        dst = src / fname
+        # rtt_heartbeat_template.c 复制时重命名为 rtt_heartbeat.c
+        dst_name = _RTT_HEARTBEAT_DST if fname == _RTT_HEARTBEAT_SRC else fname
+        dst = src / dst_name
         if dst.exists():
             skipped.append(str(dst))
             continue
@@ -840,6 +845,369 @@ def full_rtt_integrate(
     return results
 
 
+# ============================================================================
+# 全量脚本化：rtt-integrate --static-addr
+# ============================================================================
+
+def _find_main_c(project_root: Path) -> Path | None:
+    """在项目中查找 main.c 真实路径。
+
+    候选位置（按优先级）：
+    1. applications/main.c
+    2. src/main.c
+    3. main.c（项目根）
+    4. User/main.c
+    """
+    candidates = [
+        project_root / "applications" / "main.c",
+        project_root / "src" / "main.c",
+        project_root / "main.c",
+        project_root / "User" / "main.c",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # 回退：递归搜索
+    matches = list(project_root.glob("**/main.c"))
+    return matches[0] if matches else None
+
+
+def _register_keil_files(uvprojx_path: str, file_entries: list[tuple[str, str]]) -> dict:
+    """在 Keil uvprojx 中注册源文件到指定 Group。
+
+    Args:
+        uvprojx_path: 工程文件路径
+        file_entries: [(group_name, file_path), ...] 列表
+
+    Returns:
+        {"success": bool, "added": [...], "skipped": [...], "errors": [...]}
+    """
+    import xml.etree.ElementTree as ET
+    uvprojx = Path(uvprojx_path)
+    if not uvprojx.exists():
+        return {"success": False, "added": [], "skipped": [], "errors": [f"工程文件不存在: {uvprojx_path}"]}
+
+    try:
+        tree = ET.parse(str(uvprojx))
+        root_el = tree.getroot()
+    except ET.ParseError as e:
+        return {"success": False, "added": [], "skipped": [], "errors": [f"XML 解析失败: {e}"]}
+
+    target = root_el.find(".//Target")
+    if target is None:
+        return {"success": False, "added": [], "skipped": [], "errors": ["未找到 Target 节点"]}
+
+    groups_el = target.find("Groups")
+    if groups_el is None:
+        groups_el = ET.SubElement(target, "Groups")
+
+    added = []
+    skipped = []
+    errors = []
+
+    for group_name, file_path in file_entries:
+        file_path = file_path.replace("/", "\\")
+        file_name = Path(file_path).name
+
+        # 找或创建 Group
+        group_el = None
+        for g in groups_el.findall("Group"):
+            gn = g.find("GroupName")
+            if gn is not None and gn.text == group_name:
+                group_el = g
+                break
+        if group_el is None:
+            group_el = ET.SubElement(groups_el, "Group")
+            ET.SubElement(group_el, "GroupName").text = group_name
+            ET.SubElement(group_el, "Files")
+        files_el = group_el.find("Files")
+        if files_el is None:
+            files_el = ET.SubElement(group_el, "Files")
+
+        # 检查是否已存在
+        exists = False
+        for f in files_el.findall("File"):
+            fp = f.find("FilePath")
+            if fp is not None and fp.text == file_path:
+                exists = True
+                skipped.append(file_path)
+                break
+        if not exists:
+            file_el = ET.SubElement(files_el, "File")
+            ET.SubElement(file_el, "FileName").text = file_name
+            ET.SubElement(file_el, "FileType").text = "1"
+            ET.SubElement(file_el, "FilePath").text = file_path
+            added.append(f"{group_name}/{file_path}")
+
+    if added:
+        try:
+            tree.write(str(uvprojx), encoding="utf-8", xml_declaration=True)
+        except OSError as e:
+            return {"success": False, "added": [], "skipped": skipped,
+                    "errors": [f"写工程文件失败: {e}"]}
+
+    return {"success": len(errors) == 0, "added": added, "skipped": skipped, "errors": errors}
+
+
+def _update_scatter_for_rtt(sct_path: str, static_addr: str, rtt_size: int = 0x1000) -> dict:
+    """更新 scatter 文件，添加 RW_IRAM_RTT 段（静态 RTT 模式）。
+
+    操作：
+    1. 备份 scatter
+    2. 找到 RW_IRAM1 段，缩小其 size 以让出 RTT 区域
+    3. 在 RW_IRAM1 段后插入 RW_IRAM_RTT 段
+
+    Returns:
+        {"success": bool, "backup": str, "changes": [...], "errors": [...]}
+    """
+    import re
+    sct = Path(sct_path)
+    if not sct.exists():
+        return {"success": False, "backup": None, "changes": [], "errors": [f"scatter 不存在: {sct_path}"]}
+
+    backup = _backup_file(sct)
+
+    try:
+        text = sct.read_text(encoding="utf-8", errors="ignore")
+    except OSError as e:
+        return {"success": False, "backup": str(backup), "changes": [], "errors": [f"读 scatter 失败: {e}"]}
+
+    changes = []
+
+    # 如果已有 RW_IRAM_RTT，跳过
+    if re.search(r"\bRW_IRAM_RTT\b", text):
+        changes.append("RW_IRAM_RTT 已存在，跳过")
+        return {"success": True, "backup": str(backup), "changes": changes, "errors": []}
+
+    # 找到 RW_IRAM1 段的 size 字段
+    # 匹配模式：RW_IRAM1 0x20000200 0x<HEX>
+    m = re.search(r"(\bRW_IRAM1\s+0x[0-9a-fA-F]+\s+)0x[0-9a-fA-F]+(\s*\{)", text)
+    if not m:
+        return {"success": False, "backup": str(backup), "changes": [],
+                "errors": ["未找到 RW_IRAM1 段，无法插入 RW_IRAM_RTT"]}
+
+    old_size_match = re.search(r"\bRW_IRAM1\s+0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+", text)
+    if not old_size_match:
+        return {"success": False, "backup": str(backup), "changes": [], "errors": ["无法解析 RW_IRAM1 size"]}
+    old_size = int(old_size_match.group(0).split()[-1], 16)
+    new_size = old_size - rtt_size
+
+    if new_size <= 0:
+        return {"success": False, "backup": str(backup), "changes": [],
+                "errors": [f"RW_IRAM1 size {old_size:#x} 不足以让出 {rtt_size:#x}"]}
+
+    new_size_str = f"0x{new_size:08X}"
+    rtt_size_str = f"0x{rtt_size:08X}"
+
+    # 替换 size
+    new_text = re.sub(
+        r"(\bRW_IRAM1\s+0x[0-9a-fA-F]+\s+)0x[0-9a-fA-F]+",
+        rf"\g<1>{new_size_str}",
+        text, count=1
+    )
+
+    # 在 RW_IRAM1 段结束的 '}' 后插入 RW_IRAM_RTT 段
+    # 找到 RW_IRAM1 块
+    block_pattern = re.compile(
+        r"(\bRW_IRAM1\s+0x[0-9a-fA-F]+\s+" + re.escape(new_size_str) +
+        r"\s*\{[^}]*\}\s*)",
+        re.DOTALL
+    )
+    block_m = block_pattern.search(new_text)
+    if not block_m:
+        return {"success": False, "backup": str(backup), "changes": [],
+                "errors": ["无法定位 RW_IRAM1 段结束位置"]}
+
+    insert = (
+        f"\n  ; RTT static area - {static_addr} (mklink-flash 静态 RTT 模式)\n"
+        f"  RW_IRAM_RTT {static_addr} {rtt_size_str}  {{\n"
+        f"   *.o (.segger_rtt_ops)\n"
+        f"  }}"
+    )
+    new_text = new_text[:block_m.end()] + insert + new_text[block_m.end():]
+
+    try:
+        sct.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return {"success": False, "backup": str(backup), "changes": [],
+                "errors": [f"写 scatter 失败: {e}"]}
+
+    changes.append(f"RW_IRAM1: {old_size:#x} → {new_size:#x}")
+    changes.append(f"RW_IRAM_RTT 新增: {static_addr} {rtt_size_str}")
+    return {"success": True, "backup": str(backup), "changes": changes, "errors": []}
+
+
+def _add_static_macro_to_keil(uvprojx_path: str, macro: str = "MKLINK_RTT_STATIC") -> dict:
+    """在 Keil uvprojx 的 Define 中添加指定宏。"""
+    import xml.etree.ElementTree as ET
+    uvprojx = Path(uvprojx_path)
+    if not uvprojx.exists():
+        return {"success": False, "added": False, "errors": [f"工程文件不存在: {uvprojx_path}"]}
+
+    try:
+        tree = ET.parse(str(uvprojx))
+        root_el = tree.getroot()
+    except ET.ParseError as e:
+        return {"success": False, "added": False, "errors": [f"XML 解析失败: {e}"]}
+
+    define_el = root_el.find(".//VariousControls/Define")
+    if define_el is None:
+        return {"success": False, "added": False, "errors": ["未找到 VariousControls/Define 节点"]}
+
+    defines = [d.strip() for d in (define_el.text or "").split(",") if d.strip()]
+    if macro in defines:
+        return {"success": True, "added": False, "errors": [f"{macro} 已存在"]}
+
+    backup = _backup_file(uvprojx)
+    defines.append(macro)
+    define_el.text = ", ".join(defines)
+    tree.write(str(uvprojx), encoding="utf-8", xml_declaration=True)
+    return {"success": True, "added": True, "backup": str(backup), "errors": []}
+
+
+def full_rtt_integrate_v2(
+    project_root: str,
+    static_addr: str | None = None,
+    uvprojx_path: str | None = None,
+    ewp_path: str | None = None,
+    src_dir: str = "src",
+    inc_dir: str = "inc",
+    main_c_path: str | None = None,
+) -> dict:
+    """完整的 RTT 集成流程（v2 全自动化版）。
+
+    步骤：
+    1. 复制 RTT 源文件 + 心跳源到项目
+    2. 注册源文件到 Keil uvprojx 文件组
+    3. 找 main.c 并加 #include + SEGGER_RTT_Init()
+    4. 在 uvprojx <Define> 加 USE_RTT 宏
+    5. （如果 static_addr 提供）加 MKLINK_RTT_STATIC 宏
+    6. （如果 static_addr 提供）更新 scatter 加 RW_IRAM_RTT 段
+    7. （如果 static_addr 提供）注册 rtt_heartbeat.c 到 applications Group
+
+    任何步骤失败自动回滚已做的修改。
+    """
+    from mklink.iar_parser import find_ewp
+    from mklink.keil_parser import find_uvprojx
+
+    root = Path(project_root).resolve()
+    backups = []  # (path, backup_path) tuples
+    results = {
+        "copy": None, "register": None, "main": None,
+        "macro_use_rtt": None, "macro_static": None,
+        "scatter": None, "register_heartbeat": None,
+        "success": False, "errors": [],
+    }
+
+    def _track_backup(backup_path: Path | None):
+        if backup_path and backup_path.exists():
+            backups.append(str(backup_path))
+
+    def _rollback():
+        for backup_path in reversed(backups):
+            try:
+                backup = Path(backup_path)
+                if backup.suffix.startswith(".bak."):
+                    original = Path(backup.stem.split(".bak.")[0])
+                    if original.exists():
+                        original.unlink()
+                    shutil.copy2(backup, original)
+                    backup.unlink()
+            except OSError as e:
+                results["errors"].append(f"回滚 {backup_path} 失败: {e}")
+
+    # 0. 检测工程（Keil 优先，uvprojx 存在时忽略 ewp）
+    if uvprojx_path is None:
+        uvprojx_path = find_uvprojx(root)
+    if ewp_path is None and uvprojx_path is None:
+        # 仅在找不到 Keil 项目时才回退到 IAR
+        ewp_path = find_ewp(root)
+    if uvprojx_path is None and ewp_path is None:
+        results["errors"].append("未找到 Keil 或 IAR 工程文件")
+        return results
+
+    # 仅支持 Keil 自动化（IAR 自动化留作后续）
+    if uvprojx_path is None and ewp_path:
+        results["errors"].append("IAR 项目全自动化集成暂未实现，请手动完成或转用 Keil")
+        return results
+
+    # 1. 复制 RTT 源文件
+    copy_result = integrate_rtt_sources(str(src_dir), str(inc_dir))
+    results["copy"] = copy_result
+    if not copy_result["success"]:
+        results["errors"].extend(copy_result.get("errors", []))
+        return results
+
+    # 2. 注册源文件到 Keil uvprojx（用绝对路径，与 add_rtt_to_keil_project 风格一致）
+    abs_src_dir = str(Path(src_dir).resolve())
+    register_entries = [
+        ("SEGGER_RTT", f"{abs_src_dir}\\SEGGER_RTT.c"),
+        ("SEGGER_RTT", f"{abs_src_dir}\\SEGGER_RTT_printf.c"),
+    ]
+    if static_addr:
+        # 心跳源已复制到 src_dir（与 SEGGER_RTT.c 一起）
+        heartbeat_path = f"{abs_src_dir}\\{_RTT_HEARTBEAT_DST}"
+        register_entries.append(("applications", heartbeat_path))
+    register_result = _register_keil_files(uvprojx_path, register_entries)
+    results["register"] = register_result
+    if not register_result["success"]:
+        results["errors"].extend(register_result.get("errors", []))
+        _rollback()
+        return results
+
+    # 3. 找 main.c 并加初始化代码
+    if main_c_path is None:
+        main_c = _find_main_c(root)
+        if main_c is None:
+            results["errors"].append(f"main.c 未找到（搜索路径: {root}）")
+            _rollback()
+            return results
+        main_c_path = str(main_c)
+
+    main_result = add_rtt_init_to_main(main_c_path)
+    results["main"] = main_result
+    if not main_result["success"]:
+        results["errors"].extend(main_result.get("errors", []))
+        _rollback()
+        return results
+
+    # 4. 加 USE_RTT 宏
+    macro_result = _add_macro_to_keil(uvprojx_path)
+    results["macro_use_rtt"] = macro_result
+    if not macro_result["success"]:
+        results["errors"].extend(macro_result.get("errors", []))
+        _rollback()
+        return results
+
+    # 5-7. 静态模式额外步骤
+    if static_addr:
+        # 5. 加 MKLINK_RTT_STATIC 宏
+        static_macro_result = _add_static_macro_to_keil(uvprojx_path)
+        results["macro_static"] = static_macro_result
+        if not static_macro_result["success"]:
+            results["errors"].extend(static_macro_result.get("errors", []))
+            _rollback()
+            return results
+
+        # 6. 更新 scatter
+        from mklink.keil_parser import find_scatter_file
+        sct_path = find_scatter_file(uvprojx_path)
+        if sct_path:
+            sct_result = _update_scatter_for_rtt(sct_path, static_addr)
+            results["scatter"] = sct_result
+            if not sct_result["success"]:
+                results["errors"].extend(sct_result.get("errors", []))
+                _rollback()
+                return results
+        else:
+            results["errors"].append("uvprojx 中未找到 ScatterFile，无法自动更新 scatter")
+            _rollback()
+            return results
+
+    results["success"] = True
+    return results
+
+
 def generate_rtt_usage_example() -> str:
     """返回 RTT 集成后的 C 代码使用示例。"""
     return """\
@@ -860,6 +1228,22 @@ def generate_rtt_usage_example() -> str:
     SEGGER_RTT_Init();
     SEGGER_RTT_printf(0, "Hello RTT! count=%d\\n", count);
 #endif
+
+// === RTT 控制块存储方式（两种模式）===
+//
+// 模式 0 (默认) — 动态搜寻：无需特殊 C 代码，链接器自动放置 _SEGGER_RTT，
+//                   PC 端从 MAP/ELF 解析地址，探针固件运行时扫描。
+//
+// 模式 1 — 静态编译：在 C 代码中用 SEGGER_RTT_SECTION 宏把控制块固定到
+//                 已知地址，PC 端用 uvprojx+scatter 静态解析段地址作为 CB 精确地址。
+//                 适合调试期间想要稳定 CB 地址、避免扫描的场合。
+//
+// 模式 1 启用步骤（以 Keil 为例）：
+//   1) 在 scatter (.sct) 加段：RW_IRAM_RTT 0x2001F800 0x00000800 { *.o (.segger_rtt_ops) }
+//   2) project.uvprojx 的 <Define> 追加: SEGGER_RTT_SECTION=.segger_rtt_ops
+//   3) 重新编译
+//   4) 切换 .mklink/rtt_config.json:rtt_storage_mode = 1（GUI 高置配置处可选）
+//   5) mklink rtt-integrate 会自动检测到静态地址并写回 rtt_addr
 
 // 注意事项:
 // - SEGGER_RTT.c 和 SEGGER_RTT_printf.c 已添加到工程的 SEGGER_RTT 分组

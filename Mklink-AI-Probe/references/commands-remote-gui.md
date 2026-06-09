@@ -93,3 +93,29 @@ API 端点：
 - `POST /api/dashboard/start` — 启动 Dashboard（body: `{"type": "rtt|serial|modbus|superwatch"}`）
 - `POST /api/dashboard/stop` — 停止 Dashboard
 - `GET /api/dashboard/status` — 查询所有 Dashboard 运行状态
+
+## 资源管理 API
+
+FastAPI 后端维护 `mklink_bridge`、`serial_port`、`modbus_port` 三类资源租约。串口/Modbus dashboard 启动后会登记租约；停止或强制释放时会同时关闭对应后台 manager，避免虚拟串口被占用后无法释放。
+
+注意：REST API 是 GUI/dashboard 的 HTTP 包装层。Agent 或命令行释放本地串口资源时优先使用 CLI，不需要启动 FastAPI：
+
+```powershell
+python -m mklink resources status --port COM3
+python -m mklink resources release-serial --port COM3
+```
+
+常用端点：
+
+- `GET /api/resources/status` — 查询当前资源占用。
+- `POST /api/resources/release-serial` — 释放当前 `serial_port` 持有者；用于串口 dashboard 占用虚拟串口时的一键释放。
+- `POST /api/resources/release` — 按 owner 或 resource 释放，例如 `{"owner":"user:dashboard:serial"}` 或 `{"resource":"serial_port"}`。
+- `POST /api/resources/release-all` — 停止所有已登记 dashboard 并释放全部租约。
+
+示例：
+
+```powershell
+curl http://127.0.0.1:8765/api/resources/status
+curl -X POST http://127.0.0.1:8765/api/resources/release-serial -H "Content-Type: application/json" -d "{}"
+curl -X POST http://127.0.0.1:8765/api/resources/release -H "Content-Type: application/json" -d "{\"resource\":\"serial_port\"}"
+```

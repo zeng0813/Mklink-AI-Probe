@@ -154,6 +154,7 @@ class RttStreamManager:
         return not self._paused.is_set()
 
     def start(self, device, *, addr: str | None = None, channel: int = 0,
+              mode: int = 0, search_size: int = 1024,
               duration: float = 86400) -> None:
         """Start RTT polling in a background thread."""
         if self._running:
@@ -171,7 +172,8 @@ class RttStreamManager:
 
         def _poll():
             try:
-                device.rtt_start(addr, channel=channel)
+                device.rtt_start(addr, channel=channel, mode=mode,
+                                 search_size=search_size)
                 start_time = time.time()
                 sample_lines = []
 

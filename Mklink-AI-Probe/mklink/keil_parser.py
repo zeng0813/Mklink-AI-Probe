@@ -361,6 +361,16 @@ def parse_scatter_file(sct_path: str) -> dict | None:
     return result if result else None
 
 
+def find_scatter_file(uvprojx_path: str) -> str | None:
+    """从 Keil uvprojx 中找到 ScatterFile 的绝对路径。
+
+    Returns:
+        scatter file 绝对路径，若未配置则返回 None
+    """
+    _, sct = uses_scatter_file(uvprojx_path)
+    return sct
+
+
 def uses_scatter_file(uvprojx_path: str) -> tuple[bool, str | None]:
     """检查 Keil 工程是否配置使用 scatter file。
 

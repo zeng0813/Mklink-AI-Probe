@@ -61,6 +61,23 @@ python -m mklink serial dashboard --port COM3 --baud 115200 --profile protocol.j
 
 浏览器自动打开，提供实时数据流、发送面板、命令队列、过滤器和帧解析视图。
 
+### 本地资源释放（不需要 FastAPI）
+
+Agent 和命令行优先使用本地 `resources` 命令释放串口资源；不需要启动 `mklink serve` 或 FastAPI。
+
+```bash
+# 查看本地 MKLink/串口锁状态
+python -m mklink resources status --port COM3
+
+# 清理指定串口的 stale 锁，并停止当前进程内的 serial dashboard manager
+python -m mklink resources release-serial --port COM3
+
+# 活进程仍占用时仅报告 PID；确认需要终止 Mklink 锁文件记录的占用进程时再显式加 --force
+python -m mklink resources release-serial --port COM3 --force
+```
+
+默认模式只移除 owner PID 已不存在的 stale lock，不会杀外部串口助手、Keil 或其它仍在运行的进程。若是外部程序占用 COM 口，需要关闭外部程序；`--force` 只应在确认锁文件记录的 owner 可以终止时使用。
+
 ### 协议 Profile 管理
 
 ```bash

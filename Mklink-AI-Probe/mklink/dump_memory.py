@@ -1,8 +1,42 @@
 """Dump Memory binary protocol parser for MKLink SuperWatch.
 
-Implements the streaming binary frame parser defined in the Dump Memory
-protocol specification. Parses frames containing up to 16 memory regions
-with MAGIC sync, CRC32 validation, and automatic resync on corruption.
+Implements the streaming binary frame parser for both OLD and B1 (chunked)
+frame formats defined in the dump_memory protocol specification.
+
+Frame formats (per firmware spec, 2026-06-06):
+
+  OLD (total_size <= 2048):
+    +0x00  8B magic           "MPMDMPMD"
+    +0x08  8B timestamp_us
+    +0x10  2B frame_length
+    +0x12  1B region_count
+    +0x13  ... region[i] = idx(1) + size(2) + data(size)
+    +EOF-6 2B flags
+    +EOF-4 4B crc32
+
+  B1 (total_size > 2048, chunked):
+    +0x00  8B magic           "MPMDMPMD"
+    +0x08  8B timestamp_us
+    +0x10  2B frame_length
+    +0x12  1B region_count
+    +0x13  2B flags
+    +0x15  4B total_size
+    +0x19  2B block_size      (firmware: fixed 2048)
+    +0x1B  2B block_index
+    +0x1D  2B block_count
+    +0x1F  4B block_crc32     (crc32 of region data payload)
+    +0x23  ... region[i] = idx(1) + size(2) + data(size)
+    +EOF-4 4B crc32            (crc32 of magic..last region data byte)
+
+Maximum single dump_memory call is 32 KiB (32768 bytes). Firmware currently
+truncates the last block by ~512B when total_size > 32 KiB, so the safe
+upper bound is 32 KiB. Callers needing more must chunk the request at the
+host level.
+
+2026-06-07 direct official API retest on MKLink V4.3.1 confirmed:
+  - cmd.dump_memory(0x08000000, 256, 0): OLD, full 256B, flags=0
+  - cmd.dump_memory(0x20010200, 32, 0): OLD, full 32B, flags=0
+  - cmd.dump_memory(0x08020000, 2049, 0): B1, 2048B + 1B, flags=0
 
 Zero internal mklink dependencies — only uses struct/binascii from stdlib.
 """
@@ -16,12 +50,32 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Protocol constants
 # ---------------------------------------------------------------------------
-MAGIC = b'\x4D\x50\x4D\x44\x4D\x50\x4D\x44'   # "DMPMDMPM"
+MAGIC = b'\x4D\x50\x4D\x44\x4D\x50\x4D\x44'   # "MPMDMPMD"
 MAGIC_LEN = 8
-HEADER_LEN = 19        # MAGIC(8) + TIMESTAMP_US(8) + FRAME_LENGTH(2) + REGION_COUNT(1)
-MIN_FRAME_LEN = 28     # HEADER + 1 region(3+0) + FLAGS(2) + CRC32(4)
+
+# OLD frame header: magic(8) + ts(8) + frame_length(2) + region_count(1) = 19
+OLD_HEADER_LEN = 19
+OLD_TRAILER_LEN = 6  # flags(2) + crc32(4)
+MIN_OLD_FRAME_LEN = OLD_HEADER_LEN + 3 + OLD_TRAILER_LEN  # 1 region(3) + 6 = 28
+
+# B1 frame header: OLD_HEADER + flags(2) + total_size(4) + block_size(2) +
+#                  block_index(2) + block_count(2) + block_crc32(4) = 35
+B1_HEADER_LEN = 35
+B1_TRAILER_LEN = 4  # crc32(4)
+MIN_B1_FRAME_LEN = B1_HEADER_LEN + 3 + B1_TRAILER_LEN  # 1 region(3) + 4 = 42
+
 MAX_FRAME_LEN = 65535
 MAX_REGIONS = 16
+EXPECTED_BLOCK_SIZE = 2048  # firmware-fixed per spec
+
+# Maximum total bytes per dump_memory() call.
+#
+# 32 KiB was confirmed safe on firmware 2026-06-06 v3:
+#   - OLD path (≤2048B): 100% reliable, CRC32 valid, full data returned
+#   - B1 path (2049..32768B): all bi received, block_crc32 + frame_crc32 valid
+# 64 KiB truncates the last block by 512B (BUG-5, see §10 of the test report).
+MAX_TOTAL_DATA_SIZE = 32 * 1024  # 32768
+
 
 # FLAGS bit masks
 FLAG_TICK_OVERFLOW    = 0x0001
@@ -36,10 +90,23 @@ _RETRY = object()
 
 
 class DumpMemoryParser:
-    """Streaming binary parser for dump_memory frames.
+    """Streaming binary parser for dump_memory frames (OLD + B1).
 
     Follows the same feed() -> list[dict] pattern as JustFloatParser
     and JScopeBinaryParser.
+
+    Each returned frame dict has:
+        "timestamp_us": int
+        "format":       "OLD" or "B1"
+        "regions":      list[(region_index, bytes)]
+        "flags":        int
+        # B1-only fields (absent for OLD):
+        "total_size":   int
+        "block_size":   int
+        "block_index":  int
+        "block_count":  int
+        "block_crc32":  int   (crc32 of region data payload)
+        "block_crc_ok": bool  (B1 region data payload CRC result)
     """
 
     def __init__(self, region_sizes: list[int] | None = None):
@@ -63,19 +130,9 @@ class DumpMemoryParser:
         return self._crc_errors
 
     def feed(self, data: bytes) -> list[dict]:
-        """Feed raw bytes, return list of parsed frame dicts.
-
-        Returns: list of {
-            "timestamp_us": int,
-            "regions": list[tuple[int, bytes]],   # [(index, data), ...]
-            "flags": int,
-        }
-        """
+        """Feed raw bytes, return list of parsed frame dicts."""
         self._buf.extend(data)
         frames: list[dict] = []
-        # Loop until no more complete frames can be extracted.
-        # _NEED_MORE is returned when the buffer doesn't have enough data;
-        # _RETRY means data was discarded but there may be more to parse.
         while True:
             result = self._try_parse()
             if result is _NEED_MORE:
@@ -84,11 +141,12 @@ class DumpMemoryParser:
                 frames.append(result)
         return frames
 
+    # ---- internal ---------------------------------------------------------
+
     def _try_parse(self):
         # Step 1: Find MAGIC
         idx = self._buf.find(MAGIC)
         if idx < 0:
-            # Keep last MAGIC_LEN-1 bytes (partial MAGIC at boundary)
             drop = len(self._buf) - MAGIC_LEN + 1
             if drop > 0:
                 self._dropped_bytes += drop
@@ -99,25 +157,24 @@ class DumpMemoryParser:
             self._dropped_bytes += idx
             del self._buf[:idx]
 
-        # Step 2: Need at least HEADER_LEN bytes
-        if len(self._buf) < HEADER_LEN:
+        # Step 2: Need at least header bytes to read frame_length
+        if len(self._buf) < OLD_HEADER_LEN:
             return _NEED_MORE
 
         frame_length = struct.unpack_from('<H', self._buf, 16)[0]
-        if frame_length < MIN_FRAME_LEN or frame_length > MAX_FRAME_LEN:
+        if frame_length < MIN_OLD_FRAME_LEN or frame_length > MAX_FRAME_LEN:
             self._dropped_bytes += MAGIC_LEN
             self._dropped_frames += 1
             del self._buf[:MAGIC_LEN]
             return _RETRY
 
-        # Step 3: Collect full frame
         if len(self._buf) < frame_length:
             return _NEED_MORE
 
         frame_bytes = bytes(self._buf[:frame_length])
         del self._buf[:frame_length]
 
-        # Step 4: CRC32 check
+        # Step 3: CRC32 check (trailing 4 bytes)
         payload = frame_bytes[:-4]
         expected_crc = struct.unpack('<I', frame_bytes[-4:])[0]
         actual_crc = binascii.crc32(payload) & 0xFFFFFFFF
@@ -126,31 +183,138 @@ class DumpMemoryParser:
             self._dropped_frames += 1
             return _RETRY
 
-        # Step 5: Parse fields
+        # Step 4: Detect B1 vs OLD
+        region_count = frame_bytes[18]
+
+        if self._looks_like_b1(frame_bytes, frame_length, region_count):
+            return self._parse_b1(frame_bytes, frame_length)
+        return self._parse_old(frame_bytes, frame_length, region_count)
+
+    @staticmethod
+    def _looks_like_b1(frame_bytes: bytes, frame_length: int, region_count: int) -> bool:
+        """Heuristic: B1 frames have a recognisable B1 header before the regions.
+
+        In a B1 frame:
+          - frame_length >= MIN_B1_FRAME_LEN (42)
+          - offset 0x13..0x14 = flags (2B, expected 0 unless error)
+          - offset 0x15..0x18 = total_size (4B, 0 < x <= MAX)
+          - offset 0x19..0x1A = block_size (2B, expect 2048)
+          - offset 0x1B..0x1C = block_index (2B)
+          - offset 0x1D..0x1E = block_count (2B)
+        """
+        if frame_length < MIN_B1_FRAME_LEN:
+            return False
+        if frame_length < B1_HEADER_LEN + 4:
+            return False
+        # B1 only triggers when total_size > 2048. Reading total_size at 0x15:
+        total_size = struct.unpack_from('<I', frame_bytes, 0x15)[0]
+        if total_size == 0 or total_size > MAX_TOTAL_DATA_SIZE:
+            return False
+        block_size = struct.unpack_from('<H', frame_bytes, 0x19)[0]
+        if block_size != EXPECTED_BLOCK_SIZE:
+            return False
+        block_index = struct.unpack_from('<H', frame_bytes, 0x1B)[0]
+        block_count = struct.unpack_from('<H', frame_bytes, 0x1D)[0]
+        if block_count == 0 or block_index >= block_count:
+            return False
+        return True
+
+    @staticmethod
+    def _parse_b1(frame_bytes: bytes, frame_length: int) -> dict:
         timestamp_us = struct.unpack_from('<Q', frame_bytes, 8)[0]
         region_count = frame_bytes[18]
+        flags = struct.unpack_from('<H', frame_bytes, 0x13)[0]
+        total_size = struct.unpack_from('<I', frame_bytes, 0x15)[0]
+        block_size = struct.unpack_from('<H', frame_bytes, 0x19)[0]
+        block_index = struct.unpack_from('<H', frame_bytes, 0x1B)[0]
+        block_count = struct.unpack_from('<H', frame_bytes, 0x1D)[0]
+        block_crc32 = struct.unpack_from('<I', frame_bytes, 0x1F)[0]
+
+        regions: list[tuple[int, bytes]] = []
+        region_payload = bytearray()
+        offset = B1_HEADER_LEN
+        for _ in range(region_count):
+            if offset + 3 > frame_length - 4:
+                break
+            region_index = frame_bytes[offset]
+            region_size = struct.unpack_from('<H', frame_bytes, offset + 1)[0]
+            offset += 3
+            if offset + region_size > frame_length - 4:
+                break
+            region_data = frame_bytes[offset:offset + region_size]
+            regions.append((region_index, region_data))
+            region_payload.extend(region_data)
+            offset += region_size
+
+        actual_block_crc32 = binascii.crc32(bytes(region_payload)) & 0xFFFFFFFF
+
+        return {
+            "timestamp_us": timestamp_us,
+            "format": "B1",
+            "regions": regions,
+            "flags": flags,
+            "total_size": total_size,
+            "block_size": block_size,
+            "block_index": block_index,
+            "block_count": block_count,
+            "block_crc32": block_crc32,
+            "block_crc_ok": actual_block_crc32 == block_crc32,
+        }
+
+    @staticmethod
+    def _parse_old(frame_bytes: bytes, frame_length: int, region_count: int) -> dict:
+        timestamp_us = struct.unpack_from('<Q', frame_bytes, 8)[0]
+        # OLD frame: regions, then flags(2), then crc32(4)
         flags = struct.unpack_from('<H', frame_bytes, frame_length - 6)[0]
 
         regions: list[tuple[int, bytes]] = []
-        offset = 19
+        offset = OLD_HEADER_LEN
         for _ in range(region_count):
             if offset + 3 > frame_length - 6:
                 break
             region_index = frame_bytes[offset]
             region_size = struct.unpack_from('<H', frame_bytes, offset + 1)[0]
             offset += 3
-            if region_size > 0 and offset + region_size <= frame_length - 6:
-                regions.append((region_index, frame_bytes[offset:offset + region_size]))
-                offset += region_size
+            if offset + region_size > frame_length - 6:
+                break
+            regions.append((region_index, frame_bytes[offset:offset + region_size]))
+            offset += region_size
 
         return {
             "timestamp_us": timestamp_us,
+            "format": "OLD",
             "regions": regions,
             "flags": flags,
         }
 
 
-MAX_TOTAL_DATA_SIZE = 2048
+# ---------------------------------------------------------------------------
+# Configurable max total data size per dump_memory batch.
+# Default = MAX_TOTAL_DATA_SIZE (32 KiB). Override with set_max_total_data_size
+# only if the connected firmware has been confirmed to support a larger value.
+# ---------------------------------------------------------------------------
+
+
+def get_max_total_data_size() -> int:
+    """Return current max total data size for dump_memory batches (bytes)."""
+    return MAX_TOTAL_DATA_SIZE
+
+
+def set_max_total_data_size(size: int) -> None:
+    """Override the max total data size for dump_memory batches.
+
+    Args:
+        size: New max in bytes. Must not exceed 32 KiB unless the connected
+              firmware has been validated to support the larger value
+              (see docs/Mklink/dump_memory_b1_chunking_test_report.md §10 BUG-5).
+    """
+    global MAX_TOTAL_DATA_SIZE
+    if size > 32 * 1024:
+        raise ValueError(
+            f"size {size} exceeds the 32 KiB safe limit. "
+            f"See dump_memory_b1_chunking_test_report.md §10 BUG-5."
+        )
+    MAX_TOTAL_DATA_SIZE = size
 
 
 def build_dump_mem_command(
@@ -167,12 +331,15 @@ def build_dump_mem_command(
         Command string like "cmd.dump_memory(0x20000054, 4, 0x2000006C, 2, 0.01)"
 
     Raises:
-        ValueError: if total region size exceeds 2048 bytes.
+        ValueError: if total region size exceeds MAX_TOTAL_DATA_SIZE (32 KiB).
+                    Use the `mklink dump` CLI's --chunk option to split large
+                    requests at the host level.
     """
     total_size = sum(size for _, size in region_pairs)
     if total_size > MAX_TOTAL_DATA_SIZE:
         raise ValueError(
-            f"Total region size {total_size} exceeds maximum {MAX_TOTAL_DATA_SIZE} bytes"
+            f"Total region size {total_size} exceeds maximum {MAX_TOTAL_DATA_SIZE} bytes "
+            f"(32 KiB). Split the request into <=32 KiB chunks at the host level."
         )
     parts = []
     for addr, size in region_pairs:

@@ -203,7 +203,33 @@ def lint_config_semantic(project_root: str) -> list[str]:
                         f"（期望 0x20000000–0x3FFFFFFF）"
                     )
 
+        # rtt_storage_mode：0=动态搜寻, 1=静态编译
+        if "rtt_storage_mode" in rtt:
+            mode = rtt["rtt_storage_mode"]
+            if mode not in (0, 1):
+                warnings.append(
+                    f"rtt_config.json: rtt_storage_mode '{mode}' 非法（应为 0 或 1）"
+                )
+
     return warnings
+
+
+def resolve_rtt_storage_mode(rtt_config: dict | None) -> int:
+    """从 rtt_config 解析 RTT 控制块存储方式，缺省时默认 0（动态搜寻）。
+
+    Args:
+        rtt_config: rtt_config.json 加载后的 dict，可为 None。
+
+    Returns:
+        0 (动态搜寻) 或 1 (静态编译)。任何异常或非法值都回退到 0。
+    """
+    if not rtt_config:
+        return 0
+    try:
+        mode = int(rtt_config.get("rtt_storage_mode", 0))
+    except (TypeError, ValueError):
+        return 0
+    return mode if mode in (0, 1) else 0
 
 
 def save_rtt_config(project_root: str, rtt_config: dict) -> None:

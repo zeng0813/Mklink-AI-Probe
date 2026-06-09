@@ -1,0 +1,98 @@
+<template>
+  <div class="status-bar">
+    <!-- Backend health indicator -->
+    <span class="status-item" v-if="backendState === 'starting'">
+      <span class="status-dot dot-starting"></span>
+      <span class="status-label">启动中...</span>
+    </span>
+    <span class="status-item" v-else-if="backendState === 'alive'">
+      <span class="status-dot dot-ok"></span>
+      <span class="status-label">后端正常</span>
+    </span>
+    <span class="status-item" v-else>
+      <span class="status-dot dot-err"></span>
+      <span class="status-label">后端离线</span>
+      <button
+        v-if="isTauri"
+        class="btn btn-sm btn-danger"
+        @click="handleRestart"
+      >
+        重启服务
+      </button>
+    </span>
+    <span class="status-divider"></span>
+    <!-- Device connection status -->
+    <span :class="['badge', deviceStatus.connected ? 'badge-ok' : 'badge-err']">
+      {{ deviceStatus.connected ? '已连接' : '未连接' }}
+    </span>
+    <span v-if="deviceStatus.mcu" class="badge badge-accent">{{ deviceStatus.mcu }}</span>
+    <span v-if="deviceStatus.idcode" class="badge badge-info">{{ deviceStatus.idcode }}</span>
+    <span v-if="wsConnected" class="badge badge-warn">WS</span>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { useMklinkApi } from '../composables/useMklinkApi'
+import { useMklinkWs } from '../composables/useMklinkWs'
+import { useBackendHealth } from '../composables/useBackendHealth'
+
+const { deviceStatus } = useMklinkApi()
+const { wsConnected } = useMklinkWs()
+const { backendState, isTauri, restart } = useBackendHealth()
+
+async function handleRestart() {
+  try {
+    await restart()
+  } catch (e) {
+    console.error('Backend restart failed:', e)
+  }
+}
+</script>
+
+<style scoped>
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.status-label {
+  white-space: nowrap;
+}
+
+.status-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--border);
+  margin: 0 2px;
+}
+
+/* Pulsing animation for "starting" dot */
+.dot-starting {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn, #b58a1b);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+
+.btn-sm {
+  padding: 0 8px;
+  font-size: 11px;
+  height: 22px;
+  line-height: 22px;
+}
+</style>

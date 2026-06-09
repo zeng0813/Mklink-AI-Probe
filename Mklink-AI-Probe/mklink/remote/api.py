@@ -30,6 +30,87 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_DASHBOARD_OWNER_TO_MANAGER = {
+    "user:dashboard:rtt": "rtt",
+    "user:dashboard:superwatch": "superwatch",
+    "user:dashboard:serial": "serial",
+    "user:dashboard:modbus": "modbus",
+    "user:dashboard:vofa": "vofa",
+}
+
+_RESOURCE_TO_FALLBACK_OWNER = {
+    "serial_port": "user:dashboard:serial",
+    "modbus_port": "user:dashboard:modbus",
+}
+
+_OWNER_REQUIRES_STOP_EVEN_IF_NOT_RUNNING = {
+    "user:dashboard:serial",
+    "user:dashboard:modbus",
+}
+
+
+def _resource_group_from_name(resource: str):
+    from mklink.remote.resource_manager import ResourceGroup
+
+    for group in ResourceGroup:
+        if resource == group.value:
+            return group
+    raise ValueError(f"Unknown resource: {resource}")
+
+
+def _stop_dashboard_for_owner(owner: str) -> list[str]:
+    manager_name = _DASHBOARD_OWNER_TO_MANAGER.get(owner)
+    if not manager_name:
+        return []
+
+    from mklink.remote.dashboards import get_managers
+
+    managers = get_managers()
+    manager = managers.get(manager_name)
+    should_stop = (
+        getattr(manager, "running", False)
+        or owner in _OWNER_REQUIRES_STOP_EVEN_IF_NOT_RUNNING
+    )
+    if manager and should_stop:
+        manager.stop()
+        return [manager_name]
+    return []
+
+
+def release_resource_owner(
+    state: dict[str, Any],
+    owner: str,
+    *,
+    stop_active: bool = True,
+) -> dict:
+    """Stop dashboard activity for an owner and release its resource leases."""
+    stopped = _stop_dashboard_for_owner(owner) if stop_active else []
+    released = state["resource_manager"].release(owner)
+    return {
+        "owner": owner,
+        "resources": [resource.value for resource in released],
+        "stopped": stopped,
+    }
+
+
+def release_resource_by_name(
+    state: dict[str, Any],
+    resource: str,
+    *,
+    stop_active: bool = True,
+) -> dict:
+    """Release the current owner of a named resource, if any."""
+    group = _resource_group_from_name(resource)
+    lease = state["resource_manager"].get_active_lease(group)
+    if lease is None:
+        fallback_owner = _RESOURCE_TO_FALLBACK_OWNER.get(resource)
+        if fallback_owner:
+            return release_resource_owner(
+                state, fallback_owner, stop_active=stop_active,
+            )
+        return {"owner": None, "resources": [], "stopped": []}
+    return release_resource_owner(state, lease.owner, stop_active=stop_active)
+
 # Eager-import FastAPI types so that typing.get_type_hints() can resolve
 # annotations in closures (e.g. the /ws handler).  The module can still be
 # imported without FastAPI — _check_fastapi() gates actual usage.
@@ -102,6 +183,9 @@ def create_app(
         "project_root": project_root,
         "resource_manager": ResourceManager(),
     }
+    _state["resource_manager"].on_preempt(
+        lambda lease, _new_owner: release_resource_owner(_state, lease.owner)
+    )
 
     # Auto-restore last project from history on startup
     try:
@@ -235,6 +319,14 @@ def create_app(
     async def update_rtt_config(
         rtt_config: dict = Body(default={}),
     ):
+        # 校验 rtt_storage_mode（值 ∈ {0, 1}）
+        if "rtt_storage_mode" in rtt_config:
+            mode = rtt_config["rtt_storage_mode"]
+            if mode not in (0, 1):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"rtt_storage_mode 必须是 0 或 1，得到 {mode}",
+                )
         save_rtt_config(_state["project_root"], rtt_config)
         return rtt_config
 
@@ -306,6 +398,23 @@ def create_app(
             project_info = load_project_info(project_root) or {}
             config_status = check_project_config(project_root)
 
+            # 探针固件版本检查（异步执行，避免阻塞事件循环）
+            firmware_check_result: dict = {"status": "skipped"}
+            try:
+                from mklink import firmware_check as _fc
+                port = None
+                # Prefer the device's port if currently connected
+                dev = _state.get("device")
+                if dev is not None and getattr(dev, "port", None):
+                    port = dev.port
+                root = _fc._resolve_firmware_root()
+                check = await loop.run_in_executor(
+                    None, _fc.check_probe_firmware, port, root
+                )
+                firmware_check_result = check.to_dict()
+            except Exception as e:
+                firmware_check_result = {"status": "skipped", "error": str(e)}
+
             return {
                 "success": True,
                 "output": output,
@@ -318,6 +427,7 @@ def create_app(
                     "errors": config_status.errors,
                     "warnings": config_status.warnings,
                 },
+                "firmware_check": firmware_check_result,
             }
         except Exception as e:
             return {
@@ -461,6 +571,28 @@ def create_app(
             "port": dev.port,
             "axf": dev.axf_status,
         }
+
+    @app.get("/api/probe/firmware-check")
+    async def probe_firmware_check():
+        """Re-run probe firmware check (no project init required).
+
+        Used by GUI's "重新检测" (recheck) button to verify the user has
+        successfully upgraded the probe after seeing the upgrade modal.
+        """
+        from mklink import firmware_check as _fc
+        try:
+            port = None
+            dev = _state.get("device")
+            if dev is not None and getattr(dev, "port", None):
+                port = dev.port
+            root = _fc._resolve_firmware_root()
+            loop = asyncio.get_event_loop()
+            check = await loop.run_in_executor(
+                None, _fc.check_probe_firmware, port, root
+            )
+            return check.to_dict()
+        except Exception as e:
+            return {"status": "skipped", "error": str(e)}
 
     # ===================================================================
     # REST API — Device Operations (convenience wrappers)
@@ -652,7 +784,14 @@ def create_app(
     async def rtt_start(
         addr: str | None = Body(default=None),
         channel: int = Body(default=0),
+        mode: int = Body(default=0),
+        search_size: int = Body(default=1024),
     ):
+        if mode not in (0, 1):
+            raise HTTPException(
+                status_code=400,
+                detail=f"mode 必须是 0 或 1，得到 {mode}",
+            )
         if not _state["device"] or not _state["device"].connected:
             raise HTTPException(status_code=400, detail="Device not connected")
         from mklink.remote.dashboards import stop_bridge_dashboards
@@ -667,7 +806,14 @@ def create_app(
             return {"status": "already_running"}
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
-            None, lambda: rtt.start(_state["device"], addr=addr, channel=channel)
+            None,
+            lambda: rtt.start(
+                _state["device"],
+                addr=addr,
+                channel=channel,
+                mode=mode,
+                search_size=search_size,
+            ),
         )
         return {"status": "started", "stopped": stopped}
 
@@ -833,6 +979,11 @@ def create_app(
         managers = get_managers()
         sm = managers["serial"]
         if sm.running:
+            _state["resource_manager"].acquire(
+                ResourceGroup.SERIAL_PORT,
+                "user:dashboard:serial",
+                preempt=True,
+            )
             return {"status": "already_running"}
 
         # Normalize port configs
@@ -855,15 +1006,30 @@ def create_app(
         if not port_configs:
             raise HTTPException(status_code=400, detail="No ports specified")
 
+        rm = _state["resource_manager"]
+        owner = "user:dashboard:serial"
+        try:
+            rm.acquire(ResourceGroup.SERIAL_PORT, owner, preempt=True)
+        except Exception as e:
+            resource = getattr(e, "resource", ResourceGroup.SERIAL_PORT)
+            conflict_owner = getattr(e, "conflict_owner", str(e))
+            raise HTTPException(
+                status_code=409,
+                detail={"conflict": conflict_owner, "resource": resource.value},
+            )
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: sm.start(port_configs))
+        try:
+            await loop.run_in_executor(None, lambda: sm.start(port_configs))
+        except Exception:
+            release_resource_owner(_state, owner, stop_active=True)
+            raise
         return {"status": "started"}
 
     @app.post("/api/dash/serial/stop")
     async def serial_stop():
-        managers = get_managers()
-        managers["serial"].stop()
-        return {"status": "stopped"}
+        result = release_resource_owner(_state, "user:dashboard:serial")
+        return {"status": "stopped", **result}
 
     @app.post("/api/dash/serial/send")
     async def serial_send(
@@ -922,7 +1088,24 @@ def create_app(
         managers = get_managers()
         mm = managers["modbus"]
         if mm.running:
+            _state["resource_manager"].acquire(
+                ResourceGroup.MODBUS_PORT,
+                "user:dashboard:modbus",
+                preempt=True,
+            )
             return {"status": "already_running"}
+
+        rm = _state["resource_manager"]
+        owner = "user:dashboard:modbus"
+        try:
+            rm.acquire(ResourceGroup.MODBUS_PORT, owner, preempt=True)
+        except Exception as e:
+            resource = getattr(e, "resource", ResourceGroup.MODBUS_PORT)
+            conflict_owner = getattr(e, "conflict_owner", str(e))
+            raise HTTPException(
+                status_code=409,
+                detail={"conflict": conflict_owner, "resource": resource.value},
+            )
 
         try:
             from mklink.modbus._client import ModbusClient
@@ -930,19 +1113,23 @@ def create_app(
                                   parity=parity, stopbits=stopbits)
             client.connect()
         except Exception as e:
+            release_resource_owner(_state, owner, stop_active=False)
             raise HTTPException(status_code=500, detail=f"Modbus connect failed: {e}")
 
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, lambda: mm.start(client, slave, registers, interval)
-        )
+        try:
+            await loop.run_in_executor(
+                None, lambda: mm.start(client, slave, registers, interval)
+            )
+        except Exception:
+            release_resource_owner(_state, owner, stop_active=True)
+            raise
         return {"status": "started"}
 
     @app.post("/api/dash/modbus/stop")
     async def modbus_stop():
-        managers = get_managers()
-        managers["modbus"].stop()
-        return {"status": "stopped"}
+        result = release_resource_owner(_state, "user:dashboard:modbus")
+        return {"status": "stopped", **result}
 
     @app.post("/api/dash/modbus/write")
     async def modbus_write(
@@ -1275,6 +1462,56 @@ def create_app(
     # ===================================================================
     # AI Session Management
     # ===================================================================
+
+    @app.get("/api/resources/status")
+    async def resources_status():
+        return _state["resource_manager"].get_status()
+
+    @app.post("/api/resources/release")
+    async def resources_release(
+        owner: str | None = Body(default=None),
+        resource: str | None = Body(default=None),
+        stop_active: bool = Body(default=True),
+    ):
+        if owner:
+            return {
+                "status": "released",
+                **release_resource_owner(_state, owner, stop_active=stop_active),
+            }
+        if resource:
+            try:
+                result = release_resource_by_name(
+                    _state, resource, stop_active=stop_active,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            return {"status": "released", **result}
+        raise HTTPException(status_code=400, detail="owner or resource is required")
+
+    @app.post("/api/resources/release-serial")
+    async def resources_release_serial(stop_active: bool = Body(default=True, embed=True)):
+        result = release_resource_by_name(
+            _state, ResourceGroup.SERIAL_PORT.value, stop_active=stop_active,
+        )
+        return {"status": "released", **result}
+
+    @app.post("/api/resources/release-all")
+    async def resources_release_all(stop_active: bool = Body(default=True, embed=True)):
+        owners = []
+        for info in _state["resource_manager"].get_status().values():
+            owner = info["owner"]
+            if owner not in owners:
+                owners.append(owner)
+        if stop_active:
+            for owner in _DASHBOARD_OWNER_TO_MANAGER:
+                if owner not in owners:
+                    owners.append(owner)
+        results = [
+            release_resource_owner(_state, owner, stop_active=stop_active)
+            for owner in owners
+        ]
+        _state["resource_manager"].release_all()
+        return {"status": "released", "results": results}
 
     @app.post("/api/session/acquire")
     async def session_acquire(

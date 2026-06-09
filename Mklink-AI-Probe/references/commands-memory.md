@@ -1,6 +1,6 @@
 # 内存、VOFA 与 AXF 调试
 
-> 触发词：read-ram、read-reg、vofa、watch、superwatch、hardfault、typeinfo、symbols、memmap
+> 触发词：read-ram、read-reg、dump-memory、flush-memory、vofa、watch、superwatch、hardfault、typeinfo、symbols、memmap
 > 返回索引：[SKILL.md](../SKILL.md)
 
 ## 内存操作
@@ -39,6 +39,136 @@ python -m mklink read-reg --addr 0xE000ED28 --width 32
 python -m mklink write-ram --addr 0x20001000 0xDE 0xAD 0xBE 0xEF
 ```
 
+**多地址写入**:PikaScript 不支持 list/tuple 展开为多地址参数,`cmd.write_ram([a,b],[v1,v2])` 会被解释为单 arg,数据写到临时区。**正确方式:多次调用**,每次 47ms 开销:
+
+```python
+# ❌ 错误 — list/tuple 语法被忽略,写到 0x0009c5xx 临时区
+cmd.write_ram([0x20001080, 0x20001090], [0x11, 0x22])
+
+# ✅ 正确 — 两次连续调用
+cmd.write_ram(0x20001080, 0x11)
+cmd.write_ram(0x20001090, 0x22)
+# 两次共 ~95ms,无串行开销
+```
+
+**参数数量限制**:实测 V4.3.1 固件在 N>16 个参数时 PikaScript 解析器异常(空响应 / NameError / 设备进入流模式)。`write_ram` 限制为 ≤16 字节单次写入。更大批量用 `flush-memory` 一次提交多地址,或 `dump_memory` 协议。
+
+**避免覆盖活跃内存区**:写入前先核对 `build/keil/List/rt-thread.map` 与 AXF 符号:
+- `0x20000000..0x200000DC`: `.mklink_res` (test fixture 控制块, magic 0x4D4B5245 "ERKM")
+- `0x20000200..0x20001374`: `.data`
+- `0x20001374..0x20001774`: `s_tf_data_buf` (test fixture 数据缓冲,**20ms 周期被覆写**)
+- `0x200017F8..0x200018F8`: `rt_thread_stack` (256B, RT-Thread 主线程栈,**绝不可覆盖**)
+- `0x20001908+`: `_heap` (RT-Thread 堆起点, **运行时向上增长**, .bss 之后未必真空闲)
+- `0x20001774..0x2000FAB0`: `.bss` (含 dbcortex 参数库 1600B 等活跃变量)
+- `0x2001F800..0x20020000`: 主线程栈 (2KB)
+
+**安全测试区**:`0x20001000..0x20001374`(.data 之前的空闲区, 896 字节) 是稳定的。
+
+`.bss` 之后的 `0x2000FA10..0x2001F800` (~65KB) **理论上是空闲的**,但**实际不可信**——RT-Thread 堆可向上分配到此处。务必先用 `python -m mklink symbols --source <axf> --filter "heap"` 看运行时堆的实际位置;或在写入前用 `vofa` / `superwatch` 读一段确认未被业务覆写。**血泪教训:不查就直接写,会撞 heap 元数据导致 HardFault → 整机重启**。
+
+#### `python -m mklink dump-memory <region> [<region> ...] [--period SEC] [--frames N] [--duration SEC] [--save FILE] [--json]`
+公共高速内存 dump，直接调用固件 `cmd.dump_memory(addr1, size1, ..., period)` 并解析 `MPMDMPMD` 二进制帧。别名：`python -m mklink dump ...`。
+
+`<region>` 格式：`ADDR:SIZE`，可重复传入多个区域。默认 `--period 0 --frames 1 --duration 2`，即只采集 1 个完整样本，避免命令意外长期占用串口流模式。
+
+```
+# 单次读取 16 字节 RAM
+python -m mklink dump-memory 0x20000000:16
+
+# 同时读取两个区域，逐帧 JSON 输出
+python -m mklink dump-memory 0x20000000:16 0x20001000:4 --json
+
+# 连续采样 10 个样本，周期 10ms
+python -m mklink dump-memory 0x20000000:16 --period 0.01 --frames 10
+
+# 按时长采集并保存 region payload 到本地文件
+python -m mklink dump-memory 0x08000000:256 --frames 0 --duration 1 --save flash_payload.bin
+```
+
+- `--save` 保存的是已解析出的 region payload，不是包含 magic/CRC 的原始协议帧。
+- `total_size <= 2048` 走 OLD 帧；`total_size > 2048` 走 B1 分块帧，CLI 会等到 B1 最后一块后计为 1 个完整样本。
+- 单次 `cmd.dump_memory()` 总长度默认限制为 32 KiB；更大范围请在 host 侧拆成多次命令。
+- 如果没有解析到任何帧，CLI 会打印设备返回的可见文本，常见原因是固件未暴露 `cmd.dump_memory` 或设备仍处于异常流模式。
+
+#### `python -m mklink flush-memory <item> [<item> ...] [--verify] [--repeat N] [--interval-ms MS]`
+静默写 RAM,支持多地址多字节(内部调用 PikaScript `cmd.flush_memory()`)。与 `write-ram` 的关键区别:
+
+- **成功无 ACK** — 设备只回显命令 + `>>>`,不输出 hexdump 预览。
+- **适合与 `dump_memory` 并发** — 不会污染二进制数据流(`write_ram` 的 hexdump 预览会打断 DumpMemoryParser 的帧解析)。
+- **多字节 / 多地址** — 单次 PikaScript 调用提交多块写入,远比 `write-ram` 的循环高效。
+- **批写支持** — `--repeat N` + `--interval-ms MS` 实现周期写入(压力测试、抖动测试用)。
+
+`<item>` 格式:`ADDR:BYTE,BYTE,...` 或 `ADDR:0xBYTE 0xBYTE ...`(逗号/空格皆可,带不带 0x 前缀皆可)。
+
+##### PikaScript 函数同时支持两种调用协议(实测 2026-06)
+
+新固件的 `cmd.flush_memory` 同时支持两条路径,CLI 会根据 item 数自动选用:
+
+| CLI 形态 | 调用的 PikaScript | 稳定性 | 推荐场景 |
+|----------|-------------------|--------|----------|
+| 单 item (1 项) | `cmd.flush_memory(0x20010200, 0xA5, 0x5A, 0xDE, 0xAD)` <br> **旧协议**(位置参数) | **100% PASS** 实测 1~16 字节全通过 | **单地址多字节**(默认推荐) |
+| 多 item (≥2 项) | `cmd.flush_memory([(0x20010200, bytes([0x11])), (0x20010400, bytes([0x22]))])` <br> **新协议**(list-of-tuples) | 多数 PASS;某些活跃地址会被固件周期覆写 | 多地址写入(唯一选择) |
+
+```
+# 单地址单字节(1 项,走旧协议)
+python -m mklink flush-memory 0x20010000:0x55
+
+# 单地址多字节(1 项,走旧协议,1~16 字节稳定)
+python -m mklink flush-memory 0x20010000:0xDE,0xAD,0xBE,0xEF
+python -m mklink flush-memory 0x20010000:0xCA,0xFE,0xBA,0xBE,0x12,0x34,0x56,0x78,0x9A,0xBC,0xDE,0xF0,0x0F,0xED,0xCB,0xA9
+
+# 多地址多字节(≥2 项,走新协议)
+python -m mklink flush-memory \
+    0x20010000:0x11,0x22,0x33 \
+    0x20010100:0x44,0x55,0x66,0x77 \
+    0x20010200:0x88
+
+# 回读验证(强烈建议对多地址 / ≥2 字节使用)
+python -m mklink flush-memory 0x20010000:0xDE,0xAD,0xBE,0xEF --verify
+
+# 周期写 10 次,每次间隔 50ms
+python -m mklink flush-memory 0x20010000:0xA5 --repeat 10 --interval-ms 50
+```
+
+##### 已知固件 bug:首次调用 / 偶发裸 `flush fail`
+实测 PikaScript `cmd.flush_memory` 在 **同一连接的首次调用** 或某些时机会返回裸 `flush fail` (无 `:` 原因),但 **写入实际上已生效**(可通过 `read-ram` 验证)。**第二次起恢复正常静默成功**。CLI 已识别为 `WARN` 而非 `FAIL`,请用 `read-ram` / `cmd.read_ram(...)` 单独验证。
+
+##### 已知固件 bug:多地址的活跃地址会被周期覆写
+固件某些数据(`.bss`/GUI 回调表/heap 元数据/任务栈)会被后台线程周期性刷新。新协议多地址写入在 `0x20010A00` 等活跃地址上的写入**会立即被覆写**——这是固件问题,不是 flush_memory 的 bug。规避:
+1. 写入前用 `python -m mklink symbols --source <axf> --filter "heap|stack|GUI"` 排除活跃地址
+2. 写入活跃地址后,**不要回读**——读到的是覆写后的状态,不是你的写入
+3. 一次性写入 1 个稳定地址,然后立即用 PikaScript 表达式 `print(0x20010000)` 等读(若可用)做"原位验证"
+
+##### 响应解析规则
+| 响应 | CLI 判定 | 含义 |
+|------|---------|------|
+| 空(只回显命令) | OK | 静默成功 |
+| `TypeError/NameError/...` | FAIL | 真实异常(参数类型/拼写错) |
+| `flush fail: <原因>` | FAIL | 显式原因(如 `data must be bytes or int list` / `item must be (addr, data)`) |
+| 裸 `flush fail` | OK + WARN | 已知固件 bug,首次/偶发,写入实际生效 |
+| 其他非空 | OK + WARN | 非预期响应,保留原始文本供排查 |
+
+##### 旧拼写向后兼容
+旧名 `flush-memroy`(带拼写错误)作为 argparse alias 仍可工作,但会打印一行 deprecation WARN 提醒改用 `flush-memory`。**注意:PikaScript 端的旧函数名 `cmd.flush_memroy` 已被新代码移除**(`NameError`);任何直接调用旧函数名的脚本/工具都需要更新到 `cmd.flush_memory`。
+
+```
+# 仍可用(自动转发 + WARN)
+python -m mklink flush-memroy 0x20010000:0x55
+# → [WARN] 'flush-memroy' 是旧拼写,已自动转发到 'flush-memory',请改用新名
+```
+
+##### 验证技巧
+PikaScript 端的 `cmd.read_ram` 显示屏对部分地址会**不显示数据行**(返回 `wRamAddr`/`wCount` 但缺第二行)——这是 read 显示 bug,与 flush_memory 无关。**解决方法**:
+- 用 `--verify`(CLI 自动 read_ram 每个地址),CLI 会同时打印 hex,数据行缺失也能在调用现场看出
+- 用 `cmd.write_ram(addr, byte)` 看它的"AFTER 回显"行(只对单字节有效)
+- 用 `python -m mklink vofa <addr> uint8_t --period 0.01`(连续采样)看实际值
+
+##### 📌 边界与分块约束
+
+`flush-memory` 的 CLI 实现**不自动分块**,超额时按 1 次命令提交。
+完整边界(单项数据量 ≤ 12KB,多地址 ≤ 8 项,varargs ≤ 20 字节,失败边界 15KB/12 项)
+与 host 端分块策略见 **[references/flush-memory.md](references/flush-memory.md)**。
+
 ### 读取 Flash
 
 #### `python -m mklink read-flash [--addr <地址>] [--size <字节数>] [--port COM6] [--save <文件名>]`
@@ -64,6 +194,42 @@ python -m mklink vofa <起始地址> <个数> --period <秒>
 - `<起始地址>`：第一个 float 变量的内存地址
 - `<个数>`：连续读取的 float 数量（1~16）
 - `--period`：采样周期（秒），最小 1us（0.000001），设为 0 停止
+
+#### dump_memory / VOFA 流停止机制
+
+`dump_memory(addr, size, period)` 和 `vofa.send(addr, type, period)` 的第 3 参数是**采样周期**(秒),**不是停止位**。`period=0` 不会停止流 — 它会立刻发一帧(或不延迟连续发)。
+
+正确的停止方式(V4.3.1 固件实测):
+
+```bash
+# 方式 1:RTTView.stop() — 通用流停止,推荐
+RTTView.stop()
+
+# 方式 2:vofa.send(0, 0) — VOFA 流专用,设置 period=0
+vofa.send(0x20000000, "uint8_t", 0)
+```
+
+| period 值 | 行为(实测) |
+|---|---|
+| 0 | 1 帧(单次 or 不延迟) — **不是停止** |
+| 1 | 1 帧(1 秒后才有下一帧) |
+| 0.001 | ~28 KB/秒(1ms 周期,接近物理上限) |
+| 0.5 | ~1 KB/秒(500ms 周期) |
+| 100 | 1 帧(100 秒后才有下一帧) |
+
+设备进入流模式后,普通 `cmd.read_ram` 会被 dump 帧污染(`wRamAddr`/`wCount` 文本混入响应)。恢复手段:
+
+```python
+# Python (mcp_bridge):
+import serial, time
+s = serial.Serial('COM5', 115200, exclusive=True)
+s.write(b'RTTView.stop()\n')
+time.sleep(0.3)
+s.read(8192)  # 清空缓冲
+s.write(b'vofa.send(0x20000000, "uint8_t", 0)\n')  # 双重保险
+time.sleep(0.3)
+s.read(8192)
+```
 
 ```
 # 从 0x20000030 开始，连续读取 5 个 float，周期 10us
@@ -234,14 +400,17 @@ python -m mklink superwatch TIM2.CNT,ADC1.DR --svd path/to/device.svd --visualiz
 
 **Dump Memory 高速模式 (`--dump-mem`)**
 
-使用 Dump Memory 二进制流协议替代逐个 `read_ram` 轮询。设备端一条命令配置所有区域后主动推送二进制帧（64 位时间戳 + CRC32 校验），延迟更低、吞吐更高。
+使用官方 `cmd.dump_memory(addr1, size1, addr2, size2, ..., period)` 二进制流协议替代逐个 `read_ram` 轮询。设备端一条命令配置所有区域后主动推送 `MPMDMPMD` 帧（64 位时间戳 + frame CRC32 校验），延迟更低、吞吐更高。同一协议也可通过公共 CLI `python -m mklink dump-memory ...` 直接使用。
 
 ```bash
 python -m mklink superwatch g_counter,g_sensor --source path/to/firmware.axf --dump-mem --visualize --period 0.01
 ```
 
-- 需要固件支持 `dump_mem.start()` / `dump_mem.stop()` 命令
-- 不支持时自动回退到 read_ram 轮询模式，无需用户干预
+- `total_size <= 2048`: OLD 普通帧。
+- `total_size > 2048`: B1 分块帧，每块最大 2048B，包含 `block_index` / `block_count` / `block_crc32`。
+- `build_dump_mem_command()` 默认允许单次最多 32 KiB；更大范围应由 host 分块。
+- V4.3.1 官方 API 直测（2026-06-07）：`0x08000000/256`、`0x20010200/32`、`0x08020000/2049` 均 PASS，flags=`0x0000`，B1 为 2048B + 1B 两块。
+- 若 flags=`0x0004`，含义是 `Region error`，优先排查目标供电、Vref、SWD、NRST、MCU 运行/低功耗/复位状态；这不是 host parser CRC 失败。
 
 #### `python -m mklink hardfault [--source <firmware.axf>] [--sp <异常栈帧地址>]`
 读取 SCB Fault 寄存器并解码 CFSR/HFSR。提供 `--sp` 时再读取 32 字节异常栈帧，并用 `arm-none-eabi-addr2line` 映射 PC/LR。

@@ -273,7 +273,23 @@ def _cli_project_init(project_root: str):
         "search_size": 1024,
         "channel": 0,
         "autostart": False,
+        "rtt_storage_mode": 0,
     })
+
+    # 探针固件版本检查（不阻塞 init）
+    try:
+        from mklink import firmware_check
+        root = firmware_check._resolve_firmware_root()
+        check = firmware_check.check_probe_firmware(port=com_port, firmware_root=root)
+        if check.status == "upgrade_required":
+            for line in check.instructions.splitlines():
+                print(line)
+        elif check.status == "no_firmware_dir":
+            print(f"[WARN] 找不到 MK-Firmware 目录 ({check.firmware_dir})，无法校验探针固件版本")
+        # ok / skipped 不打
+    except Exception as e:
+        print(f"[WARN] 探针固件版本检查异常：{e}", file=sys.stderr)
+
     print("[OK] 项目配置已保存到 .mklink/")
 
     # 检查可选依赖
@@ -375,7 +391,10 @@ def _cli_rtt(
     from mklink.bridge import MKLinkSerialBridge
     from mklink.rtt import RTTSession
     from mklink.discovery import find_mklink_cdc_port
-    from mklink.project_config import load_rtt_config, ensure_rtt_config_updated, load_config, save_config
+    from mklink.project_config import (
+        load_rtt_config, ensure_rtt_config_updated, load_config, save_config,
+        resolve_rtt_storage_mode,
+    )
 
     resolved_port = port
     if not resolved_port:
@@ -422,14 +441,20 @@ def _cli_rtt(
     print("[OK] 连接成功")
 
     session = RTTSession(bridge, channel=rtt_cfg.get("channel", 0))
-    result = session.start("", project_root=project_root)
+    rtt_mode = resolve_rtt_storage_mode(rtt_cfg)
+    mode_label = "动态搜寻" if rtt_mode == 0 else "静态编译"
+    print(f"[*] RTT 控制块存储方式: {mode_label} (rtt_storage_mode={rtt_mode})")
+    result = session.start("", project_root=project_root, mode=rtt_mode)
 
     if not result.get("control_block_addr"):
         print("[FAIL] 未找到 RTT 控制块")
         bridge.close()
         return
 
-    print(f"[OK] RTT 已启动 (控制块: {result['control_block_addr']})")
+    print(f"[OK] RTT 已启动 (控制块: {result['control_block_addr']}, 模式: {mode_label})")
+    if result.get("warnings"):
+        for w in result["warnings"]:
+            print(f"[WARN] {w}")
 
     if visualize:
         # --- RTT View 模式（Web RAW 终端）---
@@ -557,15 +582,101 @@ def _cli_project_info(project_root: str):
         print(f"  停止位: {config.get('modbus_stopbits', 1)}")
 
 
-def _cli_rtt_integrate(project_root: str, src_dir: str | None, inc_dir: str | None, force: bool = False):
+
+def _print_integration_result_v2(result: dict) -> None:
+    """打印 v2 静态模式集成结果。"""
+    print()
+    print("=" * 52)
+    print("  RTT 静态模式集成结果")
+    print("=" * 52)
+
+    copy = result.get("copy")
+    if copy and copy.get("copied"):
+        print("\n[1] 复制源文件:")
+        for f in copy["copied"]:
+            print(f"  + {f}")
+
+    reg = result.get("register")
+    if reg:
+        if reg.get("added"):
+            print("\n[2] 注册源文件到 uvprojx:")
+            for f in reg["added"]:
+                print(f"  + {f}")
+        if reg.get("skipped"):
+            for f in reg["skipped"]:
+                print(f"  ~ {f} (已存在)")
+
+    main_r = result.get("main")
+    if main_r and main_r.get("success"):
+        print("\n[3] main.c 已加 #include + SEGGER_RTT_Init()")
+
+    macro = result.get("macro_use_rtt")
+    if macro and macro.get("added"):
+        print("\n[4] USE_RTT 宏已加入 uvprojx <Define>")
+
+    sm = result.get("macro_static")
+    if sm and sm.get("added"):
+        print("\n[5] MKLINK_RTT_STATIC 宏已加入 uvprojx <Define>")
+
+    sct = result.get("scatter")
+    if sct and sct.get("success"):
+        print("\n[6] scatter 已更新:")
+        for c in sct.get("changes", []):
+            print(f"  - {c}")
+
+    if result.get("errors"):
+        print("\n[FAIL] 错误:")
+        for e in result["errors"]:
+            print(f"  - {e}")
+
+
+def _find_and_save_rtt_addr(project_root: str) -> None:
+    """从 MAP 文件查 RTT 地址并写入 .mklink/rtt_config.json。"""
+    from pathlib import Path
+    from mklink.rtt_addr import find_rtt_addr_from_map
+    from mklink.project_config import load_project_info, save_rtt_config, load_rtt_config
+
+    root_path = Path(project_root)
+    project = load_project_info(project_root) or {}
+    map_path = project.get("map_path")
+    if not map_path:
+        for c in root_path.glob("**/*.map"):
+            map_path = str(c)
+            break
+
+    if map_path and Path(map_path).exists():
+        addr = find_rtt_addr_from_map(map_path)
+        if addr:
+            rtt_cfg = load_rtt_config(project_root) or {}
+            old = rtt_cfg.get("rtt_addr", "")
+            rtt_cfg["rtt_addr"] = addr
+            rtt_cfg["rtt_storage_mode"] = 1
+            save_rtt_config(project_root, rtt_cfg)
+            print(f"[OK] RTT 地址已更新: {old or '(空)'} -> {addr} (rtt_storage_mode=1)")
+        else:
+            print("[!] RTT 地址未找到，请重新编译项目后再次运行")
+    else:
+        print("[!] 未找到 MAP 文件，无法自动获取 RTT 地址")
+
+
+
+def _cli_rtt_integrate(
+    project_root: str,
+    src_dir: str | None,
+    inc_dir: str | None,
+    force: bool = False,
+    static_addr: str | None = None,
+):
     """集成 SEGGER RTT 源文件到项目。
 
-    自动完成:
-    1. 复制 RTT 源文件到项目 src/ 和 inc/
-    2. 将文件添加到 Keil 或 IAR 工程
-    3. 在 main.c 中添加 SEGGER_RTT_Init() 调用（USE_RTT 宏保护）
-    4. 在工程中添加 USE_RTT 宏定义
-    5. 查找并保存 RTT 控制块地址到配置文件
+    模式 1（默认）：仅动态模式，集成 RTT 后从 MAP/ELF 解析地址。
+    模式 2（--static-addr）：一键启用静态编译，包含：
+        1. 复制 RTT 源 + 心跳源
+        2. 注册到 uvprojx 文件组
+        3. 加 #include "SEGGER_RTT.h" + SEGGER_RTT_Init() 到 main.c
+        4. 加 USE_RTT 和 MKLINK_RTT_STATIC 宏
+        5. 更新 scatter 加 RW_IRAM_RTT 段
+        任何步骤失败自动回滚。
     """
     from pathlib import Path
     from mklink.project_config import load_keil_project, save_rtt_config
@@ -634,8 +745,26 @@ def _cli_rtt_integrate(project_root: str, src_dir: str | None, inc_dir: str | No
             print("[OK] RTT 源文件已存在于项目中（使用 --force 强制重新集成）")
             return
 
-    # 执行完整集成流程
-    print("\n[*] 开始 RTT 集成...")
+    # 静态模式：调用 v2 全自动化函数
+    if static_addr:
+        print(f"\n[*] 开始 RTT 静态编译模式集成（CB 地址: {static_addr}）...")
+        from mklink.rtt_integration import full_rtt_integrate_v2
+        result = full_rtt_integrate_v2(
+            project_root=project_root,
+            static_addr=static_addr,
+            src_dir=src_dir,
+            inc_dir=inc_dir,
+        )
+        _print_integration_result_v2(result)
+        if not result["success"]:
+            print("\n[FAIL] 静态模式集成失败（已自动回滚）")
+            return
+        # 集成成功后查 RTT 地址写回配置
+        _find_and_save_rtt_addr(project_root)
+        return
+
+    # 动态模式：调用原 full_rtt_integrate
+    print("\n[*] 开始 RTT 集成（动态模式）...")
     result = full_rtt_integrate(
         project_root=project_root,
         uvprojx_path=None,  # 自动查找
@@ -751,6 +880,7 @@ def _cli_rtt_integrate(project_root: str, src_dir: str | None, inc_dir: str | No
         "search_size": 1024,
         "channel": 0,
         "autostart": False,
+        "rtt_storage_mode": 0,
     })
 
     if rtt_addr:
@@ -835,6 +965,107 @@ def _cli_read_ram(port: str | None, addr: str, size: int, save: str | None):
         print(f"[FAIL] {e}")
     finally:
         bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# 烧录器版本信息
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# 匹配 "  V4.3.1" 形式的版本号（行首允许空白，版本号严格 V\d+.\d+.\d+）
+_VERSION_LINE_RE = _re.compile(r"^\s*(V\d+\.\d+\.\d+)\s*$", _re.MULTILINE)
+
+
+def _parse_version_response(text: str) -> tuple[str | None, list[str]]:
+    """从 cmd.get_version() 响应中解析当前版本与历史。
+
+    Args:
+        text: 设备响应的完整文本（已 UTF-8 解码）。
+
+    Returns:
+        (current_version, [history_versions]) 元组。
+        current_version 为 None 表示未找到版本号。
+        history_versions 按时间倒序排列（最新在前）。
+    """
+    matches = _VERSION_LINE_RE.findall(text)
+    if not matches:
+        return None, []
+    current, *history = matches
+    return current, history
+
+
+def _cli_version(port: str | None, all_history: bool = False, raw: bool = False):
+    """读取烧录器自身固件版本（cmd.get_version）。
+
+    默认输出当前版本号；--all 输出完整版本历史；
+    --raw 输出设备原始响应（不做解析）。
+    """
+    from mklink.bridge import MKLinkSerialBridge
+
+    port = _resolve_port(port)
+    print(f"[*] 连接 {port} ...")
+    bridge = MKLinkSerialBridge(port)
+    if not bridge.connect():
+        print("[FAIL] 连接失败")
+        return
+
+    try:
+        print("[*] 发送 cmd.get_version()")
+        resp = bridge.send_command("cmd.get_version()", timeout=5.0)
+    except Exception as e:
+        print(f"[FAIL] {e}")
+        bridge.close()
+        return
+
+    bridge.close()
+
+    if raw:
+        print(resp.rstrip())
+        return
+
+    current, history = _parse_version_response(resp)
+    if current is None:
+        print("[WARN] 响应中未识别到 V*.*.* 版本号")
+        print("      可能是设备固件变更或未处于 PikaScript 交互模式")
+        print("      原始响应:")
+        print(resp.rstrip())
+        return
+
+    print(f"[OK] 烧录器固件版本: {current}")
+
+    if all_history:
+        print()
+        print("=== 完整版本历史 ===")
+        # 从原始响应中按版本号切分段落；只输出以 V*.*.* 起始的段
+        # （开头的 "cmd.get_version()"/"使用手册: ..." 不属于版本段，跳过）
+        sections = _re.split(r"^\s*(?=V\d+\.\d+\.\d+\s*$)", resp, flags=_re.MULTILINE)
+        for section in sections:
+            section = section.strip()
+            if not section:
+                continue
+            first_line, _, rest = section.partition("\n")
+            first_line = first_line.strip()
+            # 防御：非 V*.*.* 起始的段不视为版本段
+            if not _re.match(r"^V\d+\.\d+\.\d+$", first_line):
+                continue
+            print(f"  {first_line}")
+            for line in rest.splitlines():
+                line = line.rstrip()
+                if line:
+                    print(f"    {line}")
+            print()
+    else:
+        if history:
+            # 打印相邻的最近几个版本作为快速参考
+            preview = history[:3]
+            print(f"     近期版本: {', '.join(preview)}")
+            print(f"     (使用 --all 查看完整变更历史)")
+
+    # 提取并显示文档链接
+    doc_match = _re.search(r"https?://\S+", resp)
+    if doc_match:
+        print(f"     文档: {doc_match.group(0)}")
 
 
 def _format_reg_value(data: bytes, width: int) -> int | None:
@@ -926,6 +1157,471 @@ def _cli_write_ram(port: str | None, addr: str, data_bytes: list[str]):
         print(f"[FAIL] {e}")
     finally:
         bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# 静默写 RAM（flush_memory，多地址多字节）
+# ---------------------------------------------------------------------------
+
+# PikaScript 真实异常标记（应当判 FAIL）
+_FLUSH_HARD_FAIL_MARKERS = (
+    "typeerror", "nameerror", "syntaxerror", "valueerror",
+    "indexerror", "attributeerror", "keyerror",
+)
+
+
+def _parse_flush_response(resp: str) -> tuple[bool, str]:
+    """从 cmd.flush_memory() 响应判断成功/失败。
+
+    Returns:
+        (success, message)。message 在以下情况非空：
+          - success=False：失败原因
+          - success=True 且 message 以 "WARN:" 开头：固件返回了非空响应但写入可能成功
+
+    判定规则（按固件实测，2026-06）：
+      - 空响应                 → 成功（静默写）
+      - 仅命令回显（"cmd.flush_memory(...)" 单独一行）→ 成功（静默写，固件只 echo 命令）
+      - 真实异常（TypeError 等）→ 失败
+      - "flush fail: <原因>"    → 失败，msg=<原因>
+      - 裸 "flush fail"        → 视为成功+WARN（已知固件 bug：首次调用/某些情况下会
+                                  错误地打印 flush fail，但写入实际生效）
+      - 其他非空响应            → 视为成功+WARN（带原始响应）
+    """
+    body = resp.strip()
+    if not body:
+        return True, ""
+
+    # 去掉命令回显行（"cmd.flush_memory(...)" / "-> RUN ..."），剩下的才是真正的响应
+    lines = body.splitlines()
+    body_no_echo_lines = [
+        ln for ln in lines
+        if ln.strip() and not ln.strip().startswith("cmd.")
+        and not ln.strip().startswith("->")
+    ]
+    body_no_echo = "\n".join(body_no_echo_lines).strip()
+    if not body_no_echo:
+        return True, ""
+
+    lower = body_no_echo.lower()
+
+    # 真实异常（TypeError、NameError 等）
+    for marker in _FLUSH_HARD_FAIL_MARKERS:
+        if marker in lower:
+            return False, body_no_echo_lines[-1] if body_no_echo_lines else marker
+
+    # 显式原因（"flush fail: xxx"）
+    if "flush fail:" in lower:
+        for ln in body_no_echo_lines:
+            if "flush fail:" in ln.lower():
+                return False, ln.strip()
+        return False, "flush fail: <unknown>"
+
+    # 裸 "flush fail"：固件 bug，写入实际生效
+    if "flush fail" in lower:
+        return True, (
+            "WARN: 固件返回裸 'flush fail'，但已知该响应是首次调用的固件 bug，"
+            "写入通常仍生效——请用 read-ram 验证"
+        )
+
+    # 其他非空响应：当作成功但带 WARN（保留原始响应供排查）
+    return True, f"WARN: 非预期响应: {body_no_echo[:120]!r}"
+
+
+def _parse_flush_item(raw: str) -> tuple[int, list[int]]:
+    """解析一项 'ADDR:BYTE,BYTE,...' 字符串。
+
+    接受的字节写法：
+      - 逗号分隔 + 0x 前缀： "0x20010000:0x11,0x22,0x33"
+      - 逗号分隔无前缀：      "0x20010000:11,22,33"
+      - 空格分隔 + 0x 前缀：  "0x20010000:0x11 0x22 0x33"
+      - 混合：                "0x20010000:0x11 0x22,0x33"
+
+    Returns:
+        (addr_int, [byte_int, ...])
+
+    Raises:
+        ValueError: 解析失败
+    """
+    if ":" not in raw:
+        raise ValueError(f"缺少 ':' 分隔 addr 与 data（格式: ADDR:BYTE,BYTE,...）")
+    addr_part, data_part = raw.split(":", 1)
+    addr_int = int(addr_part.strip(), 16)
+    # 同时接受逗号和空格分隔
+    tokens = [t for t in data_part.replace(",", " ").split() if t]
+    if not tokens:
+        raise ValueError(f"data 部分为空（至少 1 字节）")
+    byte_list = [int(t, 16) for t in tokens]
+    return addr_int, byte_list
+
+
+def _cli_flush_memory(
+    port: str | None,
+    items: list[str],
+    verify: bool = False,
+    repeat: int = 1,
+    interval_ms: int = 0,
+):
+    """静默写 RAM（cmd.flush_memory），支持多地址多字节。
+
+    调用的 PikaScript 签名：
+        cmd.flush_memory([(addr1, bytes([b1, b2, ...])),
+                          (addr2, bytes([b3, b4, ...])),
+                          ...])
+
+    与 write-ram 的关键区别：
+      - 成功时设备不输出 hexdump 预览（仅 echo 命令 + >>>）
+      - 适合与 dump_memory 并发流式采样时使用，不会污染数据流
+      - 多地址一次提交，单笔 MCU-RTT 往返完成多块写入
+
+    Args:
+        port: COM 端口（None = 自动检测）
+        items: 写入项列表，每项格式 "ADDR:BYTE,BYTE,..."
+               例: "0x20010000:0x11,0x22,0x33" "0x20010100:0x44,0x55,0x66,0x77"
+        verify: 写完后回读校验（消耗额外时间）
+        repeat: 连续写 N 次（默认 1）
+        interval_ms: 每次写之间的间隔（毫秒）
+
+    ⚠️ 安全区选择：
+        写入前务必先用 `python -m mklink memmap --source <axf>` 核对目标地址
+        不在 .bss/.data/heap/stack 内。0x2000FA10..0x2001F800 是 .bss 之后的
+        静态未占区，但 RT-Thread 堆可向上增长，运行时未必仍空闲。
+    """
+    from mklink.bridge import MKLinkSerialBridge
+
+    if not items:
+        print("[FAIL] 未指定写入项。")
+        print("      用法: python -m mklink flush-memory 0x20010000:0x11,0x22 0x20010100:0x44,0x55")
+        print("      多地址多字节，一次提交。")
+        return
+
+    # 1) 解析所有项
+    parsed: list[tuple[int, list[int]]] = []
+    for raw in items:
+        try:
+            parsed.append(_parse_flush_item(raw))
+        except ValueError as e:
+            print(f"[FAIL] 无法解析项 {raw!r}: {e}")
+            return
+
+    # 2) 构造 PikaScript 命令字符串
+    # 实测 (2026-06): PikaScript 的 cmd.flush_memory() 同时支持两种调用形态:
+    #   - 旧协议 (单地址多字节):  cmd.flush_memory(addr, b1, b2, ...)        — 1~16 字节稳定 PASS
+    #   - 新协议 (多地址):        cmd.flush_memory([(a1, bytes([...])), ...])  — 多地址场景
+    # 单项时优先用旧协议(更可靠),多项时只能用新协议。
+    if len(parsed) == 1:
+        addr_int, byte_list = parsed[0]
+        byte_csv = ", ".join(f"0x{b:02X}" for b in byte_list)
+        flush_cmd = f"cmd.flush_memory(0x{addr_int:08X}, {byte_csv})"
+    else:
+        tuple_strs = []
+        for addr_int, byte_list in parsed:
+            byte_csv = ", ".join(f"0x{b:02X}" for b in byte_list)
+            tuple_strs.append(f"(0x{addr_int:08X}, bytes([{byte_csv}]))")
+        flush_cmd = f"cmd.flush_memory([{', '.join(tuple_strs)}])"
+
+    # 3) 连接并执行
+    port = _resolve_port(port)
+    print(f"[*] 连接 {port} ...")
+    bridge = MKLinkSerialBridge(port)
+    if not bridge.connect():
+        print("[FAIL] 连接失败")
+        return
+
+    try:
+        ok_count = 0
+        fail_count = 0
+        last_err = ""
+
+        import time as _time
+        for i in range(repeat):
+            if repeat > 1:
+                print(f"[*] [{i+1}/{repeat}] {flush_cmd}")
+            else:
+                print(f"[*] {flush_cmd}")
+
+            try:
+                resp = bridge.send_command(flush_cmd, timeout=10.0)
+            except Exception as e:
+                print(f"[FAIL] 写入异常: {e}")
+                fail_count += 1
+                continue
+
+            success, msg = _parse_flush_response(resp)
+            if success:
+                ok_count += 1
+                if msg:  # WARN
+                    print(f"  {msg}")
+                if repeat > 1:
+                    print(f"  [OK] #{i+1}")
+            else:
+                fail_count += 1
+                last_err = msg
+                print(f"[FAIL] #{i+1}: {msg}")
+                if "name" in msg.lower() and "not defined" in msg.lower():
+                    print("      提示: 烧录器固件未暴露 cmd.flush_memory，请改用 write-ram")
+                    break
+
+            if interval_ms > 0 and i < repeat - 1:
+                _time.sleep(interval_ms / 1000.0)
+
+        # 4) 汇总
+        print()
+        total_bytes = sum(len(bl) for _, bl in parsed)
+        total_addrs = len(parsed)
+        if repeat == 1:
+            if ok_count:
+                print(f"[OK] 已写入 {total_bytes} 字节到 {total_addrs} 个地址（静默）")
+            else:
+                print(f"[FAIL] 写入失败: {last_err}")
+        else:
+            print(f"[OK] 成功 {ok_count}/{repeat} 次，失败 {fail_count} 次")
+
+        # 5) 可选回读
+        if verify and ok_count > 0:
+            for addr_int, byte_list in parsed:
+                n = len(byte_list)
+                read_cmd = f"cmd.read_ram(0x{addr_int:08X}, {n})"
+                print(f"\n[*] 回读验证: {read_cmd}")
+                resp = bridge.send_command(read_cmd, timeout=5.0)
+                print(resp.strip())
+    finally:
+        bridge.close()
+
+
+def _parse_dump_region(raw: str) -> tuple[int, int]:
+    """Parse one dump-memory region: ADDR:SIZE."""
+    if ":" not in raw:
+        raise ValueError("expected ADDR:SIZE")
+    addr_part, size_part = raw.split(":", 1)
+    addr = int(addr_part.strip(), 0)
+    size = int(size_part.strip(), 0)
+    if addr < 0:
+        raise ValueError("address must be >= 0")
+    if size <= 0:
+        raise ValueError("size must be > 0")
+    return addr, size
+
+
+def _dump_frame_payload(frame: dict) -> bytes:
+    return b"".join(data for _, data in frame.get("regions", []))
+
+
+def _dump_frame_to_jsonable(frame: dict, region_pairs: list[tuple[int, int]]) -> dict:
+    item = {
+        "timestamp_us": frame.get("timestamp_us"),
+        "format": frame.get("format"),
+        "flags": frame.get("flags", 0),
+        "regions": [],
+    }
+    for idx, data in frame.get("regions", []):
+        addr = region_pairs[idx][0] if 0 <= idx < len(region_pairs) else None
+        item["regions"].append(
+            {
+                "index": idx,
+                "address": f"0x{addr:08X}" if addr is not None else None,
+                "size": len(data),
+                "hex": data.hex(" "),
+            }
+        )
+    for key in ("total_size", "block_size", "block_index", "block_count", "block_crc_ok"):
+        if key in frame:
+            item[key] = frame[key]
+    return item
+
+
+def _cli_dump_memory(
+    port: str | None,
+    regions: list[str],
+    *,
+    period: float = 0.0,
+    frames: int = 1,
+    duration: float = 2.0,
+    save: str | None = None,
+    json_output: bool = False,
+):
+    """Public dump_memory CLI.
+
+    The firmware emits binary MPMDMPMD frames. Collection is bounded by default
+    so an abandoned command does not leave the probe in stream mode forever.
+    """
+    import json
+    import time
+    from pathlib import Path
+
+    from mklink._types import DeviceState
+    from mklink.bridge import MKLinkSerialBridge
+    from mklink.dump_memory import (
+        DumpMemoryParser,
+        MAX_REGIONS,
+        build_dump_mem_command,
+    )
+
+    if not regions:
+        print("[FAIL] no regions specified")
+        print("      usage: python -m mklink dump-memory 0x20000000:16")
+        return
+    if frames < 0:
+        print("[FAIL] --frames must be >= 0")
+        return
+    if duration < 0:
+        print("[FAIL] --duration must be >= 0")
+        return
+    if frames == 0 and duration == 0:
+        print("[FAIL] --frames 0 requires --duration > 0")
+        return
+
+    try:
+        region_pairs = [_parse_dump_region(raw) for raw in regions]
+        if len(region_pairs) > MAX_REGIONS:
+            raise ValueError(f"too many regions: {len(region_pairs)} > {MAX_REGIONS}")
+        cmd = build_dump_mem_command(region_pairs, period)
+    except ValueError as exc:
+        print(f"[FAIL] invalid dump-memory request: {exc}")
+        return
+
+    port = _resolve_port(port)
+    print(f"[*] Connecting {port} ...")
+    bridge = MKLinkSerialBridge(port)
+    if not bridge.connect():
+        print("[FAIL] connect failed")
+        return
+
+    parser = DumpMemoryParser(region_sizes=[size for _, size in region_pairs])
+    collected_frames: list[dict] = []
+    saved_payload = bytearray()
+    raw_seen = bytearray()
+    sample_count = 0
+    stream_started = False
+
+    def _is_complete_sample(frame: dict) -> bool:
+        if frame.get("format") != "B1":
+            return True
+        return frame.get("block_index", 0) + 1 >= frame.get("block_count", 1)
+
+    try:
+        print(f"[*] {cmd}")
+        bridge._enter_stream(DeviceState.DUMP_STREAM)
+        stream_started = True
+        bridge._write_raw((cmd + "\n").encode("utf-8"))
+
+        start = time.monotonic()
+        deadline = start + duration if duration > 0 else None
+        while True:
+            if frames and sample_count >= frames:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+
+            raw = bridge.drain_stream_bytes()
+            if not raw:
+                time.sleep(0.005)
+                continue
+
+            if len(raw_seen) < 4096:
+                raw_seen.extend(raw[: 4096 - len(raw_seen)])
+            for frame in parser.feed(raw):
+                collected_frames.append(frame)
+                saved_payload.extend(_dump_frame_payload(frame))
+                if _is_complete_sample(frame):
+                    sample_count += 1
+
+                if json_output:
+                    print(json.dumps(_dump_frame_to_jsonable(frame, region_pairs), ensure_ascii=False))
+                else:
+                    frame_no = len(collected_frames)
+                    fmt = frame.get("format", "?")
+                    flags = frame.get("flags", 0)
+                    print(f"[{frame_no}] {fmt} timestamp_us={frame.get('timestamp_us')} flags=0x{flags:04X}")
+                    for idx, data in frame.get("regions", []):
+                        addr = region_pairs[idx][0] if 0 <= idx < len(region_pairs) else 0
+                        preview = data[:32].hex(" ")
+                        suffix = " ..." if len(data) > 32 else ""
+                        print(f"    region{idx} 0x{addr:08X} size={len(data)}  {preview}{suffix}")
+
+        if save and saved_payload:
+            Path(save).write_bytes(bytes(saved_payload))
+            print(f"[OK] saved {len(saved_payload)} bytes to {save}")
+
+        if collected_frames:
+            print(f"[OK] collected {len(collected_frames)} protocol frame(s), {sample_count} complete sample(s)")
+            if parser.crc_errors or parser.dropped_frames:
+                print(
+                    f"[WARN] parser dropped_frames={parser.dropped_frames} "
+                    f"crc_errors={parser.crc_errors} dropped_bytes={parser.dropped_bytes}"
+                )
+        else:
+            diag = raw_seen.decode("utf-8", errors="replace").strip()
+            if diag:
+                print(f"[FAIL] no dump_memory frames parsed; device response: {diag[:300]}")
+            else:
+                print("[FAIL] no dump_memory frames parsed")
+    except KeyboardInterrupt:
+        print("\n[*] interrupted")
+    except Exception as exc:
+        print(f"[FAIL] {exc}")
+    finally:
+        if stream_started:
+            try:
+                if period != 0:
+                    stop_cmd = build_dump_mem_command(region_pairs, 0)
+                    bridge._write_raw((stop_cmd + "\n").encode("utf-8"))
+                    time.sleep(0.1)
+                    try:
+                        bridge.drain_stream_bytes()
+                    except Exception:
+                        pass
+                bridge._exit_stream()
+            except Exception:
+                pass
+        bridge.close()
+
+
+def _cli_resources(args):
+    """Local resource management that does not require FastAPI."""
+    import json
+
+    from mklink.local_resources import (
+        local_resource_status,
+        release_serial_resources,
+    )
+
+    command = getattr(args, "resources_command", None)
+    if command in (None, "status"):
+        result = local_resource_status(port=getattr(args, "port", None))
+    elif command in ("release-serial", "release-all"):
+        result = release_serial_resources(
+            port=getattr(args, "port", None),
+            force=getattr(args, "force", False),
+        )
+    else:
+        print("[FAIL] unknown resources subcommand")
+        return
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    if command in (None, "status"):
+        print("[OK] local resource status")
+    else:
+        print("[OK] local serial resources checked")
+
+    bridge = result.get("mklink_bridge")
+    if bridge:
+        owner = bridge.get("owner_pid") or "-"
+        print(
+            f"  mklink_bridge: {bridge.get('action', 'status')} "
+            f"pid={owner} alive={bridge.get('owner_alive', False)}"
+        )
+    for item in result.get("serial_locks", []):
+        owner = item.get("owner_pid") or "-"
+        print(
+            f"  serial_port: {item.get('action', 'status')} "
+            f"pid={owner} alive={item.get('owner_alive', False)} "
+            f"path={item.get('path')}"
+        )
+    if result.get("stopped"):
+        print(f"  stopped: {', '.join(result['stopped'])}")
 
 
 def _cli_read_flash(port: str | None, addr: str, size: int, save: str | None, project_root: str):
@@ -2420,6 +3116,12 @@ def main():
     rtt_int_parser.add_argument("--src-dir", help="源文件目录（默认自动检测）")
     rtt_int_parser.add_argument("--inc-dir", help="头文件目录（默认自动检测）")
     rtt_int_parser.add_argument("--force", action="store_true", help="强制重新集成（即使已集成）")
+    rtt_int_parser.add_argument(
+        "--static-addr",
+        help="启用 RTT 静态编译模式，指定 CB 绝对地址（如 0x2001F000）。"
+             "自动完成：复制 RTT+心跳源、注册文件组、加 USE_RTT/MKLINK_RTT_STATIC 宏、"
+             "更新 scatter 加 RW_IRAM_RTT 段。任何步骤失败自动回滚。"
+    )
 
     # copy-flm 子命令
     copy_flm_parser = subparsers.add_parser("copy-flm", help="拷贝 FLM 文件到 MICROKEEN 磁盘")
@@ -2450,6 +3152,18 @@ def main():
     read_ram_parser.add_argument("--size", type=int, default=256, help="读取字节数（默认 256）")
     read_ram_parser.add_argument("--save", help="保存到设备文件（如 ram.bin）")
 
+    # version 子命令
+    version_parser = subparsers.add_parser(
+        "version", help="读取烧录器自身固件版本（cmd.get_version）"
+    )
+    version_parser.add_argument("--port", help="COM 端口（默认自动检测）")
+    version_parser.add_argument(
+        "--all", action="store_true", help="显示完整版本历史（默认仅显示当前版本）"
+    )
+    version_parser.add_argument(
+        "--raw", action="store_true", help="输出设备原始响应（不解析）"
+    )
+
     # read-reg 子命令
     read_reg_parser = subparsers.add_parser("read-reg", help="读取内存映射寄存器（复用 cmd.read_ram）")
     read_reg_parser.add_argument("register", nargs="?", help="寄存器名（如 SCB.CFSR）")
@@ -2465,6 +3179,63 @@ def main():
     write_ram_parser.add_argument("--port", help="COM 端口（默认自动检测）")
     write_ram_parser.add_argument("--addr", required=True, help="写入地址（如 0x20001000）")
     write_ram_parser.add_argument("data", nargs="+", help="待写入的字节（如 0xDE 0xAD 0xBE 0xEF）")
+
+    # flush-memory 子命令（静默写 RAM，多地址多字节）
+    # 调用的 PikaScript 函数: cmd.flush_memory([(addr, bytes([...])), ...])
+    # （旧名 cmd.flush_memroy 已重命名；旧 CLI 名 flush-memroy 作为别名保留，见下方）
+    dump_memory_parser = subparsers.add_parser(
+        "dump-memory",
+        aliases=["dump"],
+        help="读取 dump_memory 二进制帧（公共高速内存 dump；默认采集 1 个样本）",
+    )
+    dump_memory_parser.add_argument("--port", help="COM 端口（默认自动检测）")
+    dump_memory_parser.add_argument(
+        "regions",
+        nargs="+",
+        help="内存区域，格式 ADDR:SIZE；可重复，例如 0x20000000:16 0x20001000:4",
+    )
+    dump_memory_parser.add_argument(
+        "--period",
+        type=float,
+        default=0.0,
+        help="dump_memory 采样周期秒；0=单次样本",
+    )
+    dump_memory_parser.add_argument(
+        "--frames",
+        type=int,
+        default=1,
+        help="采集完整样本数量；0=仅按 --duration 限制",
+    )
+    dump_memory_parser.add_argument(
+        "--duration",
+        type=float,
+        default=2.0,
+        help="最长采集秒数；默认 2s，防止流模式占用",
+    )
+    dump_memory_parser.add_argument("--save", help="保存 region payload 到本地二进制文件")
+    dump_memory_parser.add_argument("--json", action="store_true", help="逐帧 JSON 输出")
+
+    flush_memory_parser = subparsers.add_parser(
+        "flush-memory",
+        aliases=["flush-memroy"],  # 旧拼写向后兼容（但用法是新的）
+        help="静默写 RAM（cmd.flush_memory，多地址多字节；适合与 dump_memory 并发）",
+    )
+    flush_memory_parser.add_argument("--port", help="COM 端口（默认自动检测）")
+    flush_memory_parser.add_argument(
+        "items", nargs="+",
+        help='写入项，格式 "ADDR:BYTE,BYTE,..."，可传多项\n'
+             '  字节接受 0x11 / 11，逗号或空格分隔\n'
+             '  例: 0x20010000:0x11,0x22,0x33  0x20010100:0x44,0x55,0x66,0x77',
+    )
+    flush_memory_parser.add_argument(
+        "--verify", action="store_true", help="写完后回读校验（消耗额外时间）"
+    )
+    flush_memory_parser.add_argument(
+        "--repeat", type=int, default=1, help="连续写 N 次（默认 1）"
+    )
+    flush_memory_parser.add_argument(
+        "--interval-ms", type=int, default=0, help="每次写之间的间隔（毫秒，默认 0）"
+    )
 
     # read-flash 子命令
     read_flash_parser = subparsers.add_parser("read-flash", help="读取目标芯片 Flash 数据（自动加载 FLM）")
@@ -2650,6 +3421,44 @@ def main():
     pm_generate.add_argument("--doc", default=None, help="Markdown documentation output path")
     pm_generate.add_argument("--yes", action="store_true", help="Write files without prompting")
 
+    # local resource management (no FastAPI required)
+    resources_parser = subparsers.add_parser(
+        "resources",
+        aliases=["resource"],
+        help="Local resource management (serial lock cleanup; no FastAPI required)",
+    )
+    resources_sub = resources_parser.add_subparsers(dest="resources_command")
+
+    resources_status = resources_sub.add_parser(
+        "status", help="Show local serial/MKLink resource lock status"
+    )
+    resources_status.add_argument("--port", default=None, help="Optional serial port, e.g. COM3")
+    resources_status.add_argument("--json", action="store_true", help="Print JSON")
+
+    resources_release_serial = resources_sub.add_parser(
+        "release-serial",
+        help="Release stale local serial resources without starting FastAPI",
+    )
+    resources_release_serial.add_argument("--port", default=None, help="Optional serial port, e.g. COM3")
+    resources_release_serial.add_argument(
+        "--force",
+        action="store_true",
+        help="Terminate a live owner process recorded in mklink lock files",
+    )
+    resources_release_serial.add_argument("--json", action="store_true", help="Print JSON")
+
+    resources_release_all = resources_sub.add_parser(
+        "release-all",
+        help="Release stale local serial resources for all known mklink locks",
+    )
+    resources_release_all.add_argument("--port", default=None, help="Optional serial port, e.g. COM3")
+    resources_release_all.add_argument(
+        "--force",
+        action="store_true",
+        help="Terminate live owner processes recorded in mklink lock files",
+    )
+    resources_release_all.add_argument("--json", action="store_true", help="Print JSON")
+
     # ─── serial 串口调试 ───────────────────────────────────────────────
     serial_parser = subparsers.add_parser(
         "serial", help="通用串口调试（收发、监控、Dashboard）"
@@ -2826,7 +3635,11 @@ def main():
     elif args.command == "project-info":
         _cli_project_info(_resolve_project_root(args))
     elif args.command == "rtt-integrate":
-        _cli_rtt_integrate(_resolve_project_root(args), args.src_dir, args.inc_dir, args.force)
+        _cli_rtt_integrate(
+            _resolve_project_root(args),
+            args.src_dir, args.inc_dir, args.force,
+            static_addr=getattr(args, "static_addr", None),
+        )
     elif args.command == "copy-flm":
         _cli_copy_flm(_resolve_project_root(args))
     elif args.command == "flash":
@@ -2843,10 +3656,34 @@ def main():
         )
     elif args.command == "read-ram":
         _cli_read_ram(args.port, args.addr, args.size, args.save)
+    elif args.command == "version":
+        _cli_version(args.port, all_history=args.all, raw=args.raw)
     elif args.command == "read-reg":
         _cli_read_reg(args.port, args.register, args.addr, args.width, args.count, args.format, args.raw)
     elif args.command == "write-ram":
         _cli_write_ram(args.port, args.addr, args.data)
+    elif args.command in ("dump-memory", "dump"):
+        _cli_dump_memory(
+            args.port,
+            args.regions,
+            period=args.period,
+            frames=args.frames,
+            duration=args.duration,
+            save=args.save,
+            json_output=args.json,
+        )
+    elif args.command == "flush-memory":
+        # argparse aliases: 旧拼写 "flush-memroy" 仍可工作，但会归一化为
+        # 主名 "flush-memory"，故此处需要查 sys.argv 才能知道用户实际敲的。
+        import sys as _sys
+        if len(_sys.argv) > 1 and _sys.argv[1] == "flush-memroy":
+            print("[WARN] 'flush-memroy' 是旧拼写，已自动转发到 'flush-memory'，请改用新名")
+        _cli_flush_memory(
+            args.port, args.items,
+            verify=args.verify, repeat=args.repeat, interval_ms=args.interval_ms,
+        )
+    elif args.command in ("resources", "resource"):
+        _cli_resources(args)
     elif args.command == "read-flash":
         _cli_read_flash(args.port, args.addr, args.size, args.save, _resolve_project_root(args))
     elif args.command == "vofa":

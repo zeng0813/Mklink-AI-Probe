@@ -313,14 +313,33 @@ class Device:
         *,
         channel: int = 0,
         search_size: int = 1024,
+        mode: int | None = None,
     ) -> dict:
+        """启动 RTT 会话。
+
+        Args:
+            addr: RTT 控制块地址（None 时从 rtt_config.json 读）。
+            channel: RTT 通道号。
+            search_size: 探针扫描字节数（仅模式 0 生效）。
+            mode: 0=动态搜寻 / 1=静态编译。None 时从 rtt_config.json:rtt_storage_mode 读。
+        """
         self._require_connected()
         if self._rtt_session and self._rtt_session._running:
             self._rtt_session.stop()
+
+        # 未显式传入时，从 rtt_config.json 解析
+        if mode is None:
+            from mklink.project_config import load_rtt_config, resolve_rtt_storage_mode
+            rtt_cfg = load_rtt_config(self._project_root)
+            mode = resolve_rtt_storage_mode(rtt_cfg)
+
         from mklink.rtt import RTTSession
         self._rtt_session = RTTSession(self._bridge, channel=channel)
         return self._rtt_session.start(
-            addr or "", search_size=search_size, project_root=self._project_root
+            addr or "",
+            search_size=search_size,
+            project_root=self._project_root,
+            mode=mode,
         )
 
     def rtt_read(self, duration: float = 10.0) -> str:

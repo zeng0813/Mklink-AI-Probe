@@ -251,10 +251,22 @@ static unsigned char _aTerminalId[16] = { '0', '1', '2', '3', '4', '5', '6', '7'
 //
 // RTT Control Block and allocate buffers for channel 0
 //
-SEGGER_RTT_PUT_CB_SECTION(SEGGER_RTT_CB_ALIGN(SEGGER_RTT_CB _SEGGER_RTT));
+#if defined(MKLINK_RTT_STATIC)
+  /* mklink-flash 静态编译模式（rtt_storage_mode=1）：
+     把 RTT 数据固定到 .segger_rtt_ops 段，由 scatter 文件映射到指定 RAM 地址。
+     缓冲紧随 CB 之后（+168 跳过 CB、+1024 跳过 UpBuffer）。
+     启用：在编译器 Define 加 MKLINK_RTT_STATIC，并在 scatter 加：
+       RW_IRAM_RTT <ADDR> <SIZE> { *.o (.segger_rtt_ops) }
+     关闭：移除 MKLINK_RTT_STATIC 宏，RTT 数据回到默认 .bss 布局。 */
+  SEGGER_RTT_CB_ALIGN(SEGGER_RTT_CB _SEGGER_RTT) __attribute__((section(".segger_rtt_ops"), zero_init));
+  static char _acUpBuffer  [BUFFER_SIZE_UP]   __attribute__((section(".segger_rtt_ops"), zero_init));
+  static char _acDownBuffer[BUFFER_SIZE_DOWN] __attribute__((section(".segger_rtt_ops"), zero_init));
+#else
+  SEGGER_RTT_PUT_CB_SECTION(SEGGER_RTT_CB_ALIGN(SEGGER_RTT_CB _SEGGER_RTT));
 
-SEGGER_RTT_PUT_BUFFER_SECTION(SEGGER_RTT_BUFFER_ALIGN(static char _acUpBuffer  [BUFFER_SIZE_UP]));
-SEGGER_RTT_PUT_BUFFER_SECTION(SEGGER_RTT_BUFFER_ALIGN(static char _acDownBuffer[BUFFER_SIZE_DOWN]));
+  SEGGER_RTT_PUT_BUFFER_SECTION(SEGGER_RTT_BUFFER_ALIGN(static char _acUpBuffer  [BUFFER_SIZE_UP]));
+  SEGGER_RTT_PUT_BUFFER_SECTION(SEGGER_RTT_BUFFER_ALIGN(static char _acDownBuffer[BUFFER_SIZE_DOWN]));
+#endif
 
 static char _ActiveTerminal;
 

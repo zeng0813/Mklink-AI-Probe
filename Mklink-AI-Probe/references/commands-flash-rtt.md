@@ -1,6 +1,6 @@
 # 烧录、RTT 与工程配置
 
-> 触发词：flash、rtt、project-init、discover、Keil、IAR、copy-flm
+> 触发词：flash、rtt、project-init、discover、version、Keil、IAR、copy-flm
 > 返回索引：[SKILL.md](../SKILL.md)
 
 ## 命令说明
@@ -29,6 +29,41 @@
 [OK] 连接成功
 IDCODE 响应: idcode = 0X2BA01477
 [*] 已断开连接
+```
+
+#### `python -m mklink version [--port COM6] [--all] [--raw]`
+读取烧录器自身固件版本（内部调用 PikaScript `cmd.get_version()`）。注意：
+- **这是烧录器固件版本，不是目标 MCU 固件版本**（目标 MCU 固件版本请用 `read-ram` 读固定地址或通过项目自定义的 dump 命令）。
+- 默认仅显示当前版本号 + 近期 3 个版本 + 文档链接。
+- `--all` 显示完整版本历史（按 V*.*.* 段切分）。
+- `--raw` 直接打印设备原始响应（不解析）。
+- 与 `discover` 类似,支持端口自动检测/持久化,配置见 `.mklink/config.json`。
+
+```
+[*] 连接 COM6 ...
+[OK] 连接成功
+[*] 发送 cmd.get_version()
+[OK] 烧录器固件版本: V4.3.1
+     近期版本: V4.3.0, V4.2.3, V4.2.1
+     文档: https://microboot.readthedocs.io/zh-cn/latest/tools/microlink/microlink
+[*] 已断开连接
+```
+
+`--all` 模式：
+
+```
+[*] 连接 COM6 ...
+[OK] 连接成功
+[*] 发送 cmd.get_version()
+[OK] 烧录器固件版本: V4.3.1
+
+=== 完整版本历史 ===
+  V4.3.1
+    1.增加flush_memroy api
+  V4.3.0
+    1.解决xxx.FLM.o文件导致的损坏文件系统的问题
+    2.增加dump_memory的API
+  ...
 ```
 
 ### 烧录操作

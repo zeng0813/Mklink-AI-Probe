@@ -18,9 +18,11 @@
 | "查看变量类型" / "DWARF 类型" / "结构体布局" | `python -m mklink typeinfo --source <axf> --var <变量>` 或 `--struct <结构体>` |
 | "变量快照" / "watch 变量" | `python -m mklink watch var1,var2 --source <axf>` |
 | "SuperWatch" / "连续观察变量" / "变量和寄存器实时看板" / "read_ram 时间戳采样" | `python -m mklink superwatch var1,struct.field,SCB.CFSR --source <axf> --visualize --period 0.1` |
-| "dump memory" / "二进制流采样" / "SuperWatch 高速模式" | `python -m mklink superwatch var1,var2 --source <axf> --dump-mem --visualize` |
+| "dump memory" / "内存二进制 dump" / "高速读取内存" | `python -m mklink dump-memory 0x20000000:16`（公共 `cmd.dump_memory` CLI；按地址/长度直接 dump） |
+| "SuperWatch 高速模式" / "变量二进制流采样" | `python -m mklink superwatch var1,var2 --source <axf> --dump-mem --visualize` |
 | "内存占用" / "memmap" / "RAM Flash 占用" | `python -m mklink memmap --source <axf>` |
 | "写入 RAM" / "写内存" | `python -m mklink write-ram --addr 0x20001000 0xDE 0xAD` |
+| "静默写 RAM" / "无 ACK 写" / "flush 写入" / "边 dump 边写" | `python -m mklink flush-memory 0x20010000:0x11,0x22 0x20010100:0x44,0x55`（多地址多字节；与 `dump_memory` / `vofa` 并发场景使用） |
 | "读取 Flash" / "查看 Flash 内容" / "看中断向量表" | `python -m mklink read-flash --addr 0x08000000 --size 128` |
 | "VOFA 观测" / "变量观测" / "实时波形" | 需进一步询问变量地址/类型 → `python -m mklink vofa <地址> <类型> [...] --period <秒>` |
 | "连续读取 float" / "VOFA 快速模式" / "连续观测 N 个 float" | `python -m mklink vofa 0x20000030 5 --period 0.00001`（方式1） |
@@ -29,6 +31,7 @@
 | "VOFA 可视化" / "VOFA 波形" / "变量实时图表" / "本地看 VOFA" | `python -m mklink vofa <变量参数> --visualize --period 0.01 --names 名称1,名称2` |
 | "停止 VOFA" / "停止观测" | `python -m mklink vofa --stop` |
 | "连接烧录器" / "测试连接" | `python -m mklink discover` |
+| "烧录器版本" / "查看固件版本" / "MKLink 版本" / "MicroLink 版本" | `python -m mklink version`（默认仅当前版本；`--all` 看完整历史；`--raw` 看原始响应） |
 | "查看项目配置" | `python -m mklink project-info` |
 | "初始化项目" | `python -m mklink project-init` |
 | "解析 IAR 工程" / "查看 IAR 配置" | `python -m mklink iar-parse` |
@@ -60,4 +63,5 @@
 | "发送串口数据" / "发 HEX" | `python -m mklink serial send --port COM3 --baud 115200 "..."` 或 `--hex` |
 | "串口监控" / "多端口监听" | `python -m mklink serial monitor --port COM3 --port COM4 --baud 115200` |
 | "串口 dashboard" / "串口 Web 界面" | `python -m mklink serial dashboard --port COM3 --baud 115200` |
+| "释放串口" / "串口被占用" / "虚拟串口占用" / "清理串口资源" | `python -m mklink resources release-serial --port COM3`（本地 CLI，不需要启动 FastAPI；只清理 stale 锁，活进程需显式 `--force`） |
 | "生成协议 profile" / "从 C 结构体生成串口协议" | `python -m mklink serial profile detect --source inc/uart_protocol.h` |

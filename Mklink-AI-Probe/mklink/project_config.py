@@ -17,6 +17,7 @@ from pathlib import Path
 _CONFIG_FILE = "config.json"
 _PROJECT_INFO_FILE = "project_info.json"  # IDE-agnostic project config (formerly keel_project.json)
 _RTT_CONFIG_FILE = "rtt_config.json"
+_TOOLCHAIN_CONFIG_FILE = "toolchain.json"  # optional GNU Arm host-tool overrides (read by toolchain.py)
 _JSCOPE_PROJECT_FILE = "jscope_project.json"
 
 _HEX_ADDR_RE = _re.compile(r"^0x[0-9a-fA-F]{1,8}$")
@@ -101,6 +102,18 @@ def save_jscope_project(project_root: str, data: dict) -> None:
 def load_rtt_config(project_root: str) -> dict | None:
     """读取 .mklink/rtt_config.json。"""
     return _load_json(project_root, _RTT_CONFIG_FILE)
+
+
+# --- toolchain.json: optional GNU Arm host-tool path overrides ---
+
+def load_toolchain_config(project_root: str) -> dict | None:
+    """读取 .mklink/toolchain.json（可选；留空键表示自动解析）。"""
+    return _load_json(project_root, _TOOLCHAIN_CONFIG_FILE)
+
+
+def save_toolchain_config(project_root: str, toolchain_config: dict) -> None:
+    """写入 .mklink/toolchain.json。"""
+    _save_json(project_root, _TOOLCHAIN_CONFIG_FILE, toolchain_config)
 
 
 def lint_json_file(project_root: str, filename: str) -> str | None:

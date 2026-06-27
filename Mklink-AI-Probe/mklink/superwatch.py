@@ -263,14 +263,18 @@ def resolve_watch_items(
 
 
 def _symbol_size_lookup(source: str) -> dict[str, int]:
+    from mklink.toolchain import resolve_readelf
+    tool = resolve_readelf()
+    if not tool:
+        return {}
     try:
         result = subprocess.run(
-            ["arm-none-eabi-readelf", "-s", source],
+            [tool, "-s", source],
             capture_output=True,
             text=True,
             timeout=30,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
         return {}
     if result.returncode != 0:
         return {}

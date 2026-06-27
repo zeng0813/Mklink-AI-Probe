@@ -87,7 +87,7 @@ python -m mklink dump-memory 0x08000000:256 --frames 0 --duration 1 --save flash
 
 - `--save` 保存的是已解析出的 region payload，不是包含 magic/CRC 的原始协议帧。
 - `total_size <= 2048` 走 OLD 帧；`total_size > 2048` 走 B1 分块帧，CLI 会等到 B1 最后一块后计为 1 个完整样本。
-- 单次 `cmd.dump_memory()` 总长度默认限制为 32 KiB；更大范围请在 host 侧拆成多次命令。
+- 单次 `cmd.dump_memory()` 总长度默认 **512 KiB**（固件 V4.3.3 实测整片 Flash 稳定，256 个 B1 块全 `flags=0x0000`）。**老固件**（pre-V4.3.3，BUG-5：>64 KiB 末块截尾 512B）请传 ≤32 KiB 的 `ADDR:SIZE` region 规避。
 - 如果没有解析到任何帧，CLI 会打印设备返回的可见文本，常见原因是固件未暴露 `cmd.dump_memory` 或设备仍处于异常流模式。
 
 #### `python -m mklink flush-memory <item> [<item> ...] [--verify] [--repeat N] [--interval-ms MS]`
@@ -163,11 +163,14 @@ PikaScript 端的 `cmd.read_ram` 显示屏对部分地址会**不显示数据行
 - 用 `cmd.write_ram(addr, byte)` 看它的"AFTER 回显"行(只对单字节有效)
 - 用 `python -m mklink vofa <addr> uint8_t --period 0.01`(连续采样)看实际值
 
-##### 📌 边界与分块约束
+##### 📌 边界与分块约束（三类边界务必区分）
 
-`flush-memory` 的 CLI 实现**不自动分块**,超额时按 1 次命令提交。
-完整边界(单项数据量 ≤ 12KB,多地址 ≤ 8 项,varargs ≤ 20 字节,失败边界 15KB/12 项)
-与 host 端分块策略见 **[references/flush-memory.md](references/flush-memory.md)**。
+`flush-memory` 受**三类独立边界**约束：① 固件协议边界（单地址 ≥16300B、多地址 ≤8 项）；② PC CLI 安全阈值（命令串 ≤230B、≤8 项/批）；③ Windows 命令行长度限制（逐字节展开 ≈16KB 即撞墙）。
+
+- 非重复数据 CLI **不自动分块**，超 230B 直接 `FAIL`。
+- **重复字节**用紧凑语法 `ADDR:BYTE*N`（如 `flush-memory "0x20008000:0xAA*16300"`），CLI 自动转 `bytes([0xVV])*N` 短表达式，绕开 ②③，单次可写数 KB。
+- **PowerShell**：始终用单引号包裹整个 item（`'0x...:0xAA*N'`），否则逗号会被预处理改写参数。
+- 完整边界表与 host 端分块策略见 **[references/flush-memory.md](references/flush-memory.md)**。
 
 ### 读取 Flash
 
@@ -408,7 +411,7 @@ python -m mklink superwatch g_counter,g_sensor --source path/to/firmware.axf --d
 
 - `total_size <= 2048`: OLD 普通帧。
 - `total_size > 2048`: B1 分块帧，每块最大 2048B，包含 `block_index` / `block_count` / `block_crc32`。
-- `build_dump_mem_command()` 默认允许单次最多 32 KiB；更大范围应由 host 分块。
+- `build_dump_mem_command()` 默认允许单次最多 **512 KiB**（V4.3.3 实测整片 Flash 稳定）；老固件请传 ≤32 KiB region；更大范围仍应由 host 分块。
 - V4.3.1 官方 API 直测（2026-06-07）：`0x08000000/256`、`0x20010200/32`、`0x08020000/2049` 均 PASS，flags=`0x0000`，B1 为 2048B + 1B 两块。
 - 若 flags=`0x0004`，含义是 `Region error`，优先排查目标供电、Vref、SWD、NRST、MCU 运行/低功耗/复位状态；这不是 host parser CRC 失败。
 

@@ -21,6 +21,38 @@ pip install pymodbus>=3.0
 安装完成后，`python -m mklink` 命令即可正常使用。
 
 
+## 作为 Claude Code 插件使用（MCP 能力层）
+
+本 Skill 同时是一个 Claude Code **插件**：根目录 `.claude-plugin/plugin.json` + `.mcp.json` 暴露 **42 个 MCP tool**（`mcp__mklink__*`，覆盖连接/烧录/内存/变量/调试/符号/RTT/HardFault/Modbus/串口），由 `python -m mklink mcp` 以 stdio 方式启动。MCP server **依赖 `fastmcp`**，需安装 `mcp` extras：
+
+```powershell
+pip install -e ".[mcp]"
+```
+
+验证 MCP server 可启动（应向 stderr 打印 FastMCP 横幅并等待 stdio JSON-RPC 输入，Ctrl+C 退出）：
+
+```powershell
+python -m mklink mcp
+```
+
+**普通用户安装本插件**（无需上架 marketplace，走 skills-directory 机制）：
+
+```powershell
+# 1. 把本目录放到 Claude Code 的 skills 目录下
+git clone <repo-url> "$env:USERPROFILE\.claude\skills\mklink-flash"
+#   （或手动复制整个目录到 ~/.claude/skills/mklink-flash/）
+
+# 2. 安装 Python 包 + MCP 依赖（使 .mcp.json 中的 python -m mklink mcp 可用）
+cd "$env:USERPROFILE\.claude\skills\mklink-flash"
+pip install -e ".[mcp]"
+
+# 3. 重启 Claude Code —— 自动加载为 mklink-flash@skills-dir，MCP 工具即可用
+```
+
+> 仅使用 CLI、不用 MCP 的用户：跳过 `.[mcp]`，`pip install -e .` 即可。
+> 符号解析 / AXF 调试另需下文的 `arm-none-eabi-readelf`。
+
+
 ## GNU Arm readelf（符号解析与 AXF 调试）
 
 当用户要执行以下功能时，必须提供 `arm-none-eabi-readelf`：
@@ -80,6 +112,35 @@ arm-none-eabi-readelf --version
 python -c "import shutil, subprocess; print(shutil.which('arm-none-eabi-readelf')); subprocess.run(['arm-none-eabi-readelf','--version'], check=True)"
 python -m mklink symbols --source path/to/firmware.axf --filter "counter|sensor"
 ```
+
+
+### 不想把工具链加进 PATH？用环境变量或配置文件指定
+
+mklink 按以下顺序解析 `readelf` / `addr2line`（命中即用，首次解析后缓存）：
+
+1. 环境变量 `MKLINK_READELF` / `MKLINK_ADDR2LINE`（指向可执行文件全路径）
+2. 项目配置 `.mklink/toolchain.json`：`{"readelf": "...", "addr2line": "..."}`
+3. 常见安装位置（winget `Program Files`、WinGet 包缓存、`~/.local/tools`）
+4. PATH 上的 `arm-none-eabi-readelf` / `arm-none-eabi-addr2line`
+5. 系统 binutils 的 `readelf` / `addr2line`（GNU 版可读任意 ELF，够用）
+
+适合用便携版、或不想污染全局 PATH 的用户：
+
+```powershell
+# 方式 A：环境变量（当前会话；持久化用 setx 或系统设置）
+$env:MKLINK_READELF    = "$env:USERPROFILE\.local\tools\bin\arm-none-eabi-readelf.exe"
+$env:MKLINK_ADDR2LINE  = "$env:USERPROFILE\.local\tools\bin\arm-none-eabi-addr2line.exe"
+
+# 方式 B：项目级配置（可提交到仓库，团队共用）
+New-Item -ItemType Directory -Force -Path .mklink | Out-Null
+@{ readelf    = "C:/tools/arm-gnu/bin/arm-none-eabi-readelf.exe"
+   addr2line  = "C:/tools/arm-gnu/bin/arm-none-eabi-addr2line.exe" } |
+  ConvertTo-Json | Out-File -Encoding utf8 .mklink/toolchain.json
+```
+
+> MCP 用户：调用 `ping` 即可看到 `readelf_available` / `readelf_path`。工具缺失时
+> `connect(axf=...)` 仍会成功（探针已连上），但返回 `axf_loaded:false` 并附 `axf_error`
+> 安装提示——不会像以前那样整次连接崩溃。
 
 
 ## GUI 依赖（Web GUI 与 Tauri 桌面应用）

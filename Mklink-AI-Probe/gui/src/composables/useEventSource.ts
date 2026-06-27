@@ -1,18 +1,37 @@
-import { ref, readonly, onUnmounted } from 'vue'
+import { ref, shallowRef, readonly, onUnmounted } from 'vue'
 import type { DataPoint } from '../types/mklink'
 
 const API_BASE = import.meta.env.VITE_MKLINK_API || ''
 
-export function useEventSource(url: string) {
-  const data = ref<DataPoint[]>([])
+interface EventSourceOptions {
+  passthroughEvents?: string[]
+  maxPoints?: number
+}
+
+type StreamDataPoint = DataPoint & { _streamSeq?: number }
+
+export function useEventSource(url: string, options: EventSourceOptions = {}) {
+  const data = shallowRef<StreamDataPoint[]>([])
   const connected = ref(false)
   const error = ref<string | null>(null)
 
   let es: EventSource | null = null
-  const maxPoints = 500
+  let streamSeq = 0
+  const maxPoints = options.maxPoints ?? 500
+  const passthroughEvents = new Set(options.passthroughEvents ?? [])
+
+  function withSeq(point: DataPoint): StreamDataPoint {
+    return { ...point, _streamSeq: ++streamSeq }
+  }
+
+  function pushDataPoint(point: DataPoint) {
+    const next = [...data.value, withSeq(point)]
+    data.value = next.length > maxPoints ? next.slice(-maxPoints) : next
+  }
 
   function connect() {
     disconnect()
+    streamSeq = 0
     data.value = []
     error.value = null
 
@@ -26,20 +45,16 @@ export function useEventSource(url: string) {
     es.onmessage = (event) => {
       try {
         const parsed = JSON.parse(event.data)
-        if (parsed.event === 'data') {
-          data.value.push(parsed)
-          if (data.value.length > maxPoints) {
-            data.value = data.value.slice(-maxPoints)
-          }
-        } else if (parsed.event === 'raw') {
-          data.value.push(parsed)
-          if (data.value.length > maxPoints) {
-            data.value = data.value.slice(-maxPoints)
-          }
+        if (
+          parsed.event === 'data' ||
+          parsed.event === 'raw' ||
+          passthroughEvents.has(parsed.event)
+        ) {
+          pushDataPoint(parsed)
         } else if (parsed.event === 'history') {
           // Initial history replay
           const points = parsed.points || []
-          data.value = points.slice(-maxPoints)
+          data.value = points.slice(-maxPoints).map((point: DataPoint) => withSeq(point))
         } else if (parsed.event === 'error') {
           error.value = parsed.message
         } else if (parsed.event === 'stopped') {

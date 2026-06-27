@@ -51,16 +51,16 @@ def check_readelf_available() -> tuple[bool, str | None]:
         - (True, exe_path) 如果可用
         - (False, error_message) 如果不可用
     """
-    import shutil
     import subprocess
 
-    path = shutil.which("arm-none-eabi-readelf")
+    from mklink.toolchain import resolve_readelf
+    path = resolve_readelf()
     if not path:
-        return False, "arm-none-eabi-readelf 未找到（不在 PATH 中）"
+        return False, "arm-none-eabi-readelf 未找到（PATH / MKLINK_READELF / .mklink/toolchain.json 均无）"
 
     try:
         result = subprocess.run(
-            ["arm-none-eabi-readelf", "--version"],
+            [path, "--version"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:

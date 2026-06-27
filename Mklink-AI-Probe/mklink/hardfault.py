@@ -57,7 +57,12 @@ def parse_exception_stack_frame(data: bytes) -> dict[str, int]:
 def addr2line(source: str, *addresses: int) -> dict[int, str]:
     if not source or not addresses:
         return {}
-    cmd = ["arm-none-eabi-addr2line", "-e", source, "-f", "-p"]
+    from mklink.toolchain import resolve_addr2line
+    tool = resolve_addr2line()
+    if not tool:
+        # addr2line is best-effort (source-line decoration); absent tool → skip cleanly.
+        return {}
+    cmd = [tool, "-e", source, "-f", "-p"]
     cmd.extend(f"0x{a:08X}" for a in addresses)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)

@@ -29,6 +29,16 @@ from typing import Any, Generator
 logger = logging.getLogger(__name__)
 
 
+def _positive_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    try:
+        parsed = int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
@@ -263,6 +273,452 @@ class RttStreamManager:
         if self._history:
             yield _sse_json({"event": "history", "points": self._history[-100:]})
 
+        try:
+            while self.running or self.paused:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    yield _sse_format("", event="ping")
+                    continue
+                if data is None:
+                    break
+                yield _sse_json(data)
+                if data.get("event") == "stopped":
+                    break
+        finally:
+            self._bridge.remove_client(q)
+
+
+class SystemViewStreamManager:
+    """Manages SEGGER SystemView RTOS-trace streaming via RTT channel 1.
+
+    Reads raw bytes from the target's RTT "SysView" up-buffer, decodes them
+    with a persistent SystemViewParser (accumulating timestamps + name maps),
+    and streams decoded RTOS events (task switches, ISR, CPU%, kernel objects)
+    over SSE for the RTOS-Trace dashboard.
+    """
+
+    def __init__(self):
+        self._bridge = AsyncBridge()
+        self._thread: threading.Thread | None = None
+        self._running = False
+        self._paused = threading.Event()
+        self._paused.set()  # not paused
+        self._stop_event = threading.Event()
+        self._history: list[dict] = []
+        self._max_history = 100_000
+        self._history_buffer_us = 60_000_000
+        self._history_replay_limit = 500
+        self._live_batch_limit = 500
+        self._parser = None
+        self._stats = {"events": 0, "bytes": 0}
+        self._resolved_task_names: dict[int, str] = {}
+        self._name_resolution_attempted: set[int] = set()
+        self._last_name_resolution = 0.0
+        self._cpu_freq_source = ""
+        self._recording = None
+        self._recording_path = ""
+        self._recording_summary_path = ""
+        self._recording_error = ""
+
+    @property
+    def running(self) -> bool:
+        return self._running and not self._stop_event.is_set()
+
+    @property
+    def paused(self) -> bool:
+        return not self._paused.is_set()
+
+    def start(self, device, *, addr: str | None = None, channel: int = 1,
+              mode: int = 0, search_size: int = 1024,
+              duration: float = 86400) -> None:
+        """Start SystemView polling in a background thread."""
+        if self._running:
+            return
+
+        self._parser = self._create_parser()
+
+        self._stop_event.clear()
+        self._paused.set()
+        self._running = True
+        self._history.clear()
+        self._stats = {"events": 0, "bytes": 0}
+        self._resolved_task_names.clear()
+        self._name_resolution_attempted.clear()
+        self._last_name_resolution = 0.0
+        self._cpu_freq_source = ""
+        self._recording = None
+        self._recording_path = ""
+        self._recording_summary_path = ""
+        self._recording_error = ""
+
+        def _poll():
+            try:
+                start_result = device.systemview_start(
+                    addr, channel=channel, mode=mode, search_size=search_size,
+                )
+                self._apply_cpu_freq_hint(device, start_result)
+                self._start_recording(
+                    device,
+                    {"addr": addr, "channel": channel, "mode": mode},
+                )
+                start_time = time.time()
+                empty_cycles = 0
+                while not self._stop_event.is_set():
+                    if time.time() - start_time > duration:
+                        break
+                    if not self._paused.is_set():
+                        time.sleep(0.05)
+                        continue
+                    try:
+                        raw = device.systemview_read_bytes(
+                            duration=0.1, max_bytes=64 * 1024
+                        )
+                    except Exception:
+                        time.sleep(0.1)
+                        continue
+                    if not raw:
+                        empty_cycles += 1
+                        if empty_cycles == 4:
+                            try:
+                                device.systemview_stop()
+                                time.sleep(0.5)
+                                start_result = device.systemview_start(
+                                    addr, channel=channel, mode=mode,
+                                    search_size=search_size,
+                                )
+                                self._apply_cpu_freq_hint(device, start_result)
+                            except Exception:
+                                pass
+                        continue
+                    empty_cycles = 0
+                    self._stats["bytes"] += len(raw)
+                    now = time.time()
+                    evs = self._parser.feed(raw)
+                    self._note_init_cpu_freq(evs)
+                    self._ensure_event_time_fields(evs)
+                    self._maybe_resolve_task_names(
+                        device, evs, addr=addr, channel=channel,
+                        mode=mode, search_size=search_size,
+                    )
+                    self._apply_task_names(evs)
+                    self._stats["events"] += len(evs)
+                    self._record_events(evs)
+                    self._history.extend(evs)
+                    self._trim_history()
+                    # batch SSE：1 条消息含所有 events（减少 EventSource onmessage 次数
+                    # 从 N/周期 → 1/周期），GUI 一次 ingest。限 100/周期避免单条过大。
+                    batch = [{**ev, "_t": now} for ev in evs[-self._live_batch_limit:]]
+                    if batch:
+                        self._bridge.put({
+                            "event": "batch",
+                            "events": batch,
+                            "stats": dict(self._stats),
+                            "history_size": len(self._history),
+                            **self._status_meta(),
+                        })
+            except Exception as e:
+                logger.error("SystemView stream error: %s", e)
+                self._bridge.put({"event": "error", "message": str(e)})
+            finally:
+                try:
+                    device.systemview_stop()
+                except Exception:
+                    pass
+                self._close_recording()
+                self._running = False
+                self._bridge.put({"event": "stopped"})
+                self._bridge.stop()
+
+        self._thread = threading.Thread(target=_poll, daemon=True)
+        self._thread.start()
+
+    def _create_parser(self):
+        from mklink.systemview_parser import SystemViewParser
+
+        parser = SystemViewParser()
+        # Realtime capture often starts after SEGGER INIT/TaskInfo packets have
+        # already rolled out of the RTT ring. STM32 RT-Thread task IDs are
+        # shrunken pointers, so seed the same defaults used by Device.
+        parser._ram_base = 0x20000000
+        parser._id_shift = 2
+        return parser
+
+    def _apply_cpu_freq_hint(self, device, start_result: dict | None = None) -> int:
+        p = self._parser
+        if not p or p.cpu_freq:
+            return p.cpu_freq if p else 0
+
+        freq = 0
+        source = ""
+        result = start_result or {}
+        for key in ("cpu_freq", "cpu_freq_hint"):
+            freq = _positive_int(result.get(key))
+            if freq:
+                source = "systemview_start"
+                break
+
+        if not freq:
+            device_parser = getattr(device, "_systemview_parser", None)
+            freq = _positive_int(getattr(device_parser, "cpu_freq", 0))
+            if freq:
+                source = "device_parser"
+
+        if not freq and getattr(device, "_dwarf_info", None):
+            try:
+                freq = _positive_int(device.read_variable("SystemCoreClock"))
+                if freq:
+                    source = "SystemCoreClock"
+            except Exception:
+                freq = 0
+
+        if not freq:
+            freq = self._profile_cpu_freq_default(device)
+            if freq:
+                source = "mcu_profile_default"
+
+        if freq:
+            p._cpu_freq = freq
+            self._cpu_freq_source = source
+            self._ensure_event_time_fields(self._history)
+        return freq
+
+    def _profile_cpu_freq_default(self, device) -> int:
+        profile = None
+        try:
+            getter = getattr(device, "_get_mcu_profile", None)
+            if callable(getter):
+                profile = getter()
+        except Exception:
+            profile = None
+        if not isinstance(profile, dict):
+            return 0
+        for key in ("cpu_freq_default", "system_core_clock", "systemview_cpu_freq"):
+            freq = _positive_int(profile.get(key))
+            if freq:
+                return freq
+        return 0
+
+    def _note_init_cpu_freq(self, events: list[dict]) -> None:
+        for ev in events:
+            if ev.get("kind") == "init" and _positive_int(ev.get("cpu_freq")):
+                self._cpu_freq_source = "INIT"
+                return
+
+    def _ensure_event_time_fields(self, events: list[dict]) -> None:
+        p = self._parser
+        freq = _positive_int(getattr(p, "cpu_freq", 0))
+        if not freq:
+            return
+        for ev in events:
+            ticks = ev.get("t_ticks")
+            if "t_us" not in ev and isinstance(ticks, (int, float)):
+                ev["t_us"] = ticks * 1_000_000.0 / freq
+            delta = ev.get("delta_ticks")
+            if "cpu_delta_us" not in ev and isinstance(delta, (int, float)):
+                ev["cpu_delta_us"] = delta * 1_000_000.0 / freq
+
+    def _trim_history(self) -> None:
+        if self._history_buffer_us > 0:
+            latest_us = None
+            for ev in reversed(self._history):
+                t_us = ev.get("t_us")
+                if isinstance(t_us, (int, float)):
+                    latest_us = t_us
+                    break
+            if latest_us is not None:
+                cutoff = latest_us - self._history_buffer_us
+                self._history = [
+                    ev for ev in self._history
+                    if not isinstance(ev.get("t_us"), (int, float)) or ev["t_us"] >= cutoff
+                ]
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
+
+    def _start_recording(self, device, extra_meta: dict | None = None) -> None:
+        try:
+            from mklink.systemview_logger import SystemViewJsonlLogger
+
+            project_root = getattr(device, "_project_root", None) or "."
+            meta = {
+                **self._status_meta(),
+                **(extra_meta or {}),
+            }
+            self._recording = SystemViewJsonlLogger(project_root, meta)
+            self._recording_path = str(self._recording.path)
+            self._recording_summary_path = str(self._recording.summary_path)
+            self._recording_error = ""
+        except Exception as e:
+            self._recording = None
+            self._recording_error = str(e)
+
+    def _record_events(self, events: list[dict]) -> None:
+        if not self._recording or not events:
+            return
+        try:
+            self._recording.write_events(events)
+        except Exception as e:
+            self._recording_error = str(e)
+            try:
+                self._recording.close({"events": self._stats.get("events", 0)})
+            except Exception:
+                pass
+            self._recording = None
+
+    def _close_recording(self) -> None:
+        if not self._recording:
+            return
+        try:
+            self._recording.close({
+                "events": self._stats.get("events", 0),
+                "bytes": self._stats.get("bytes", 0),
+                "history_size": len(self._history),
+                "cpu_freq": _positive_int(getattr(self._parser, "cpu_freq", 0)),
+                "cpu_freq_source": self._cpu_freq_source,
+                "dropped_bytes": getattr(self._parser, "dropped_bytes", 0),
+                "dropped_packets": getattr(self._parser, "dropped_packets", 0),
+            })
+        except Exception as e:
+            self._recording_error = str(e)
+        finally:
+            self._recording = None
+
+    def _status_meta(self) -> dict:
+        p = self._parser
+        if not p:
+            return {
+                "synced": False,
+                "abs_time": 0,
+                "cpu_freq": 0,
+                "cpu_freq_source": "",
+                "dropped_bytes": 0,
+                "dropped_packets": 0,
+                "task_names": {},
+                "isr_names": {},
+                "recording_path": self._recording_path,
+                "recording_summary_path": self._recording_summary_path,
+                "recording_error": self._recording_error,
+            }
+        return {
+            "synced": p.synced,
+            "abs_time": p.abs_time,
+            "cpu_freq": p.cpu_freq,
+            "cpu_freq_source": self._cpu_freq_source,
+            "dropped_bytes": p.dropped_bytes,
+            "dropped_packets": p.dropped_packets,
+            "task_names": dict(p._task_names),
+            "isr_names": dict(p._isr_names),
+            "recording_path": self._recording_path,
+            "recording_summary_path": self._recording_summary_path,
+            "recording_error": self._recording_error,
+        }
+
+    def _unknown_task_ids(self, events: list[dict]) -> set[int]:
+        p = self._parser
+        if not p:
+            return set()
+        ids: set[int] = set()
+        for ev in events:
+            tid = ev.get("task_id")
+            if not isinstance(tid, int):
+                continue
+            if tid < 0x20000000:
+                continue
+            if tid in p._task_names or tid in self._name_resolution_attempted:
+                continue
+            ids.add(tid)
+        return ids
+
+    def _apply_task_names(self, events: list[dict]) -> None:
+        p = self._parser
+        if not p:
+            return
+        for ev in events:
+            tid = ev.get("task_id")
+            if isinstance(tid, int) and not ev.get("task_name"):
+                name = p._task_names.get(tid)
+                if name:
+                    ev["task_name"] = name
+
+    def _resolve_task_names(self, device, task_ids: set[int]) -> dict[int, str]:
+        ids = {int(tid) for tid in task_ids if int(tid) >= 0x20000000}
+        if not ids:
+            return {}
+        names = device.systemview_resolve_task_names(sorted(ids)) or {}
+        p = self._parser
+        if p:
+            for tid, name in names.items():
+                if name:
+                    p._task_names[int(tid)] = str(name)
+        for ev in self._history:
+            tid = ev.get("task_id")
+            if isinstance(tid, int) and tid in names and names[tid]:
+                ev["task_name"] = names[tid]
+        self._resolved_task_names.update({int(k): str(v) for k, v in names.items() if v})
+        return names
+
+    def _maybe_resolve_task_names(
+        self,
+        device,
+        events: list[dict],
+        *,
+        addr: str | None,
+        channel: int,
+        mode: int,
+        search_size: int,
+    ) -> None:
+        ids = self._unknown_task_ids(events)
+        if not ids:
+            return
+        now = time.time()
+        if now - self._last_name_resolution < 3.0:
+            return
+        self._last_name_resolution = now
+        self._name_resolution_attempted.update(ids)
+
+        try:
+            device.systemview_stop()
+            try:
+                self._resolve_task_names(device, ids)
+            finally:
+                start_result = device.systemview_start(
+                    addr, channel=channel, mode=mode, search_size=search_size,
+                )
+                self._apply_cpu_freq_hint(device, start_result)
+        except Exception as e:
+            logger.debug("SystemView task-name resolution failed: %s", e)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._running = False
+
+    def pause(self) -> None:
+        self._paused.clear()
+
+    def resume(self) -> None:
+        self._paused.set()
+
+    def get_history(self) -> list[dict]:
+        return list(self._history)
+
+    def get_status(self) -> dict:
+        return {
+            "running": self.running,
+            "paused": self.paused,
+            "clients": self._bridge.client_count,
+            "stats": self._stats,
+            "history_size": len(self._history),
+            **self._status_meta(),
+        }
+
+    async def sse_generator(self):
+        """Async SSE generator for FastAPI StreamingResponse."""
+        q = self._bridge.add_client()
+        yield _sse_json({"event": "status", **self.get_status()})
+        if self._history:
+            yield _sse_json({"event": "history", "points": self._history[-self._history_replay_limit:]})
         try:
             while self.running or self.paused:
                 try:
@@ -941,7 +1397,7 @@ class VofaStreamManager:
 
 _managers: dict[str, Any] = {}
 
-BRIDGE_DASHBOARD_TYPES = ("rtt", "superwatch", "vofa")
+BRIDGE_DASHBOARD_TYPES = ("rtt", "superwatch", "vofa", "systemview")
 
 
 def get_managers() -> dict[str, Any]:
@@ -956,6 +1412,8 @@ def get_managers() -> dict[str, Any]:
         _managers["modbus"] = ModbusStreamManager()
     if "vofa" not in _managers:
         _managers["vofa"] = VofaStreamManager()
+    if "systemview" not in _managers:
+        _managers["systemview"] = SystemViewStreamManager()
     return _managers
 
 

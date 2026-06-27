@@ -83,7 +83,10 @@ class Device:
         self._bridge = None
         self._flash = None
         self._rtt_session = None
+        self._systemview_session = None
+        self._systemview_parser = None
         self._dwarf_info = None
+        self._axf_error = None  # reason DWARF load was skipped (e.g. readelf missing)
         self._connected = False
 
     # ------------------------------------------------------------------
@@ -127,6 +130,11 @@ class Device:
                 self._rtt_session.stop()
             except Exception:
                 pass
+        if self._systemview_session and self._systemview_session._running:
+            try:
+                self._systemview_session.stop()
+            except Exception:
+                pass
         if self._bridge:
             self._bridge.close()
         self._bridge = None
@@ -167,7 +175,16 @@ class Device:
     def _load_dwarf_info(self) -> None:
         from mklink.dwarf_parser import load_dwarf_info
         if self._axf and Path(self._axf).exists():
-            self._dwarf_info = load_dwarf_info(self._axf)
+            try:
+                self._dwarf_info = load_dwarf_info(self._axf)
+                self._axf_error = None
+            except Exception as e:
+                # readelf missing / unreadable ELF / DWARF parse error: never
+                # let this crash connect() — the bridge is already up. Record
+                # the reason so axf_status / the MCP layer can surface it and
+                # guide the user (e.g. install the GNU Arm toolchain).
+                self._dwarf_info = None
+                self._axf_error = str(e)
 
     def parse_axf(self, axf_path: str | None = None) -> dict:
         """手动触发 AXF 解析。返回解析结果摘要。"""
@@ -185,9 +202,17 @@ class Device:
 
     @property
     def axf_status(self) -> dict:
-        """返回 AXF 解析状态摘要。"""
+        """返回 AXF 解析状态摘要（含工具链可用性与失败原因）。"""
+        from mklink.toolchain import status as toolchain_status
+        tc = toolchain_status()
         if not self._dwarf_info:
-            return {"loaded": False, "axf_path": self._axf}
+            out: dict = {"loaded": False, "axf_path": self._axf,
+                         "readelf_available": tc["readelf_available"]}
+            if self._axf_error:
+                out["error"] = self._axf_error
+            elif self._axf and not Path(self._axf).exists():
+                out["error"] = f"AXF file not found: {self._axf}"
+            return out
         info = self._dwarf_info
         return {
             "loaded": True,
@@ -195,6 +220,7 @@ class Device:
             "variable_count": len(info.variables),
             "struct_count": len(info.structs),
             "enum_count": len(info.enums),
+            "readelf_available": tc["readelf_available"],
         }
 
     # ------------------------------------------------------------------
@@ -403,6 +429,143 @@ class Device:
         return collected
 
     # ------------------------------------------------------------------
+    # SystemView（RTOS 跟踪：RTT 通道 1 二进制流 → SEGGER 事件解码）
+    # ------------------------------------------------------------------
+    def systemview_start(
+        self,
+        addr: str | None = None,
+        *,
+        channel: int = 1,
+        search_size: int = 1024,
+        mode: int | None = None,
+    ) -> dict:
+        """启动 SystemView 采集（RTT 通道 1，二进制）。
+
+        Args:
+            addr: RTT 控制块地址（None 时从 rtt_config.json 读，与 RTT 共用）。
+            channel: SystemView 上行通道号（SEGGER 默认 1）。
+            search_size: 探针扫描字节数（仅 mode=0 生效）。
+            mode: 0=动态搜寻 / 1=静态编译。None 时从 rtt_config.json 读。
+        """
+        self._require_connected()
+        if self._systemview_session and self._systemview_session._running:
+            self._systemview_session.stop()
+
+        if mode is None:
+            from mklink.project_config import load_rtt_config, resolve_rtt_storage_mode
+            rtt_cfg = load_rtt_config(self._project_root)
+            mode = resolve_rtt_storage_mode(rtt_cfg)
+
+        # SystemView 与 RTT 共用同一探针 bridge，二者互斥
+        if self._rtt_session and self._rtt_session._running:
+            self._rtt_session.stop()
+            self._rtt_session = None
+
+        from mklink.systemview import SystemViewSession
+        from mklink.systemview_parser import SystemViewParser
+        self._systemview_session = SystemViewSession(self._bridge, channel=channel)
+        result = self._systemview_session.start(
+            addr or "",
+            search_size=search_size,
+            project_root=self._project_root,
+            mode=mode,
+        )
+        # 每次 start 重建解码器，累计时间戳与 name 映射
+        self._systemview_parser = SystemViewParser()
+        # SEGGER ID 还原默认（INIT 包常被 16KB 环形缓冲在高事件率下覆盖）：
+        # STM32 SRAM base 0x20000000 + ID_SHIFT=2（SEGGER 默认，4 字节对齐）。
+        # 这样 task_id 还原成真实 rt_thread 指针，便于直接读线程名。INIT 若抓到
+        # 会覆盖为同值。非 STM32 工程可后续从 MCU profile 取 ram base。
+        self._systemview_parser._ram_base = 0x20000000
+        self._systemview_parser._id_shift = 2
+        # 尝试读 SystemCoreClock 作为 cpu_freq（与 SEGGER 的 SYSVIEW_CPU_FREQ 同源），
+        # 用于把 DWT 周期时间戳换算成 µs/秒率。需 axf 符号；无则保持 0（ticks 模式）。
+        if self._dwarf_info:
+            try:
+                freq = self.read_variable("SystemCoreClock")
+                if isinstance(freq, int) and freq > 0:
+                    self._systemview_parser._cpu_freq = freq
+                    result.setdefault("cpu_freq_hint", freq)
+            except Exception:
+                pass
+        return result
+
+    def systemview_read_bytes(
+        self, duration: float = 2.0, max_bytes: int | None = None
+    ) -> bytes:
+        """读取 duration 秒的原始 SystemView 字节（未解码）。"""
+        self._require_connected()
+        if not self._systemview_session or not self._systemview_session._running:
+            raise DeviceError("SystemView not started. Call systemview_start() first.")
+        return self._systemview_session.read_bytes(
+            duration=duration, max_bytes=max_bytes
+        )
+
+    def systemview_read(self, duration: float = 2.0) -> dict:
+        """读取并解码 duration 秒的 SystemView 事件。
+
+        用持久化解码器（跨多次 read 累计绝对时间戳与 task/isr name 映射）。
+        返回 ``{"events": [...], "synced", "abs_time", "cpu_freq",
+        "task_names", "isr_names", "dropped_bytes", "dropped_packets"}``。
+        """
+        self._require_connected()
+        if not self._systemview_session or not self._systemview_session._running:
+            raise DeviceError("SystemView not started. Call systemview_start() first.")
+        raw = self._systemview_session.read_bytes(duration=duration)
+        events = self._systemview_parser.feed(raw) if raw else []
+        p = self._systemview_parser
+        return {
+            "events": events,
+            "event_count": len(events),
+            "bytes_read": len(raw),
+            "synced": p.synced,
+            "abs_time": p.abs_time,
+            "cpu_freq": p.cpu_freq,
+            "task_names": dict(p._task_names),
+            "isr_names": dict(p._isr_names),
+            "dropped_bytes": p.dropped_bytes,
+            "dropped_packets": p.dropped_packets,
+        }
+
+    def systemview_stop(self) -> None:
+        """停止 SystemView 采集。"""
+        self._require_connected()
+        if not self._systemview_session:
+            return
+        self._systemview_session.stop()
+        self._systemview_session = None
+        self._systemview_parser = None
+
+    def systemview_resolve_task_names(
+        self, task_ids: list[int]
+    ) -> dict[int, str]:
+        """直接读 RT-Thread 线程名（不依赖开机 INIT 包）。
+
+        task_id（解码器已还原为真实指针）即 ``rt_thread*``。RT-Thread 的
+        ``rt_thread`` 继承 ``rt_object``，``name[RT_NAME_MAX]`` 在 ``rt_object``
+        内（4.x 典型偏移 12：list[8]+type[1]+color[1]+flag[2]），版本间有差异。
+        故扫描候选偏移 [8..28]，对每处取以 ``\\0`` 结尾的 C 标识符（线程名如
+        ``idle/main/tshell``）；指针字段不会匹配标识符模式，故能准确锁定 name。
+        """
+        import re
+        self._require_connected()
+        name_re = re.compile(rb'^[A-Za-z_][A-Za-z0-9_]*')
+        names: dict[int, str] = {}
+        for tid in task_ids:
+            for off in (0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48):
+                try:
+                    raw = self.read_memory(int(tid) + off, 8)
+                except Exception:
+                    break  # bridge 出错则放弃此 tid
+                nul = raw.find(b'\x00')
+                cand = raw if nul < 0 else raw[:nul]
+                m = name_re.match(cand)
+                if m and len(m.group()) >= 2:
+                    names[int(tid)] = m.group().decode('ascii')
+                    break
+        return names
+
+    # ------------------------------------------------------------------
     # Memory
     # ------------------------------------------------------------------
     def read_memory(self, address: int, size: int) -> bytes:
@@ -414,10 +577,25 @@ class Device:
 
     def write_memory(self, address: int, data: bytes) -> None:
         self._require_connected()
-        addr_s = f"0x{address:08X}"
-        args = ", ".join(f"0x{b:02X}" for b in data)
-        cmd = f"cmd.write_ram({addr_s}, {args})"
-        self._bridge.send_command(cmd, timeout=10.0)
+        if not data:
+            return
+        # cmd.write_ram 的逐字节参数在当前探针固件不稳定（写入不生效，回读为空）；
+        # 改用 cmd.flush_memory 的 bytes 表达式（与 MCP flush_memory 一致）：
+        # 全相同字节折叠为短表达式（单条可达 12 KiB），非重复数据按 30B 分块，
+        # 保证命令串 < 230（PIKA_LINE_BUFF 上限）。详见 references/flush-memory.md。
+        CHUNK = 30
+        i = 0
+        while i < len(data):
+            rest = data[i:]
+            if all(b == rest[0] for b in rest):
+                seg, step = rest, len(rest)
+                expr = f"bytes([0x{seg[0]:02X}])*{len(seg)}"
+            else:
+                seg, step = rest[:CHUNK], CHUNK
+                expr = "bytes([" + ", ".join(f"0x{b:02X}" for b in seg) + "])"
+            cmd = f"cmd.flush_memory([(0x{address + i:08X}, {expr})])"
+            self._bridge.send_command(cmd, timeout=10.0)
+            i += step
 
     # ------------------------------------------------------------------
     # Variables
@@ -570,8 +748,8 @@ class Device:
         self._require_connected()
         if not self._axf:
             raise DeviceError("No AXF/ELF loaded for memory map analysis.")
-        from mklink.memmap import parse_sections
-        return parse_sections(self._axf)
+        from mklink.memmap import analyze_memmap
+        return analyze_memmap(self._axf)
 
 
 # ======================================================================

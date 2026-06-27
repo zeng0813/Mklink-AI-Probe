@@ -29,6 +29,7 @@ import ControlToolbar from './ControlToolbar.vue'
 import VariableChips from './VariableChips.vue'
 import CrossPickerCanvas from './CrossPickerCanvas.vue'
 import RawLogPanel from './RawLogPanel.vue'
+import { takeNewStreamPoints } from '../../lib/streamCursor'
 
 const props = defineProps<{ deviceConnected: boolean }>()
 
@@ -39,6 +40,7 @@ const chart = ref<InstanceType<typeof CrossPickerCanvas> | null>(null)
 const rawLines = ref<string[]>([])
 const activeChannels = ref<Set<string>>(new Set())
 const maxRawLines = 500
+let lastStreamSeq = 0
 
 const DASH_NAMES: Record<string, string> = {
   rtt: 'RTT', superwatch: 'SuperWatch', vofa: 'VOFA+',
@@ -62,21 +64,22 @@ function toggleChannel(name: string) {
 }
 
 // Push SSE data to chart
-watch(data, (newData, oldData) => {
+watch(data, (newData) => {
   if (!chart.value) return
-  const start = oldData?.length || 0
-  for (let i = start; i < newData.length; i++) {
-    const dp = newData[i]
-    if (dp._event === 'data' || !dp._event) {
+  const fresh = takeNewStreamPoints(newData as any[], lastStreamSeq)
+  for (const dp of fresh.points as any[]) {
+    const evt = dp.event || dp._event
+    if (evt === 'data' || !evt) {
       chart.value.pushDataPoint(dp as Record<string, unknown>)
-    } else if (dp._event === 'raw') {
+    } else if (evt === 'raw') {
       rawLines.value.push(dp.line as string)
       if (rawLines.value.length > maxRawLines) {
         rawLines.value = rawLines.value.slice(-maxRawLines)
       }
     }
   }
-}, { deep: true })
+  lastStreamSeq = fresh.nextSeq
+})
 
 async function onStart() {
   const conflicts = await checkConflict('rtt')
@@ -94,6 +97,7 @@ async function onStop() {
   disconnect()
   await dash.stop()
   rawLines.value = []
+  lastStreamSeq = 0
 }
 </script>
 

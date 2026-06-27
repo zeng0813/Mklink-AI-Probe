@@ -36,6 +36,7 @@ _DASHBOARD_OWNER_TO_MANAGER = {
     "user:dashboard:serial": "serial",
     "user:dashboard:modbus": "modbus",
     "user:dashboard:vofa": "vofa",
+    "user:dashboard:systemview": "systemview",
 }
 
 _RESOURCE_TO_FALLBACK_OWNER = {
@@ -187,14 +188,15 @@ def create_app(
         lambda lease, _new_owner: release_resource_owner(_state, lease.owner)
     )
 
-    # Auto-restore last project from history on startup
-    try:
-        _hist = load_project_history()
-        _last = _hist.get("last_project")
-        if _last and os.path.isdir(_last):
-            _state["project_root"] = _last
-    except Exception:
-        pass
+    # Auto-restore last project from history on startup（仅当未显式指定 project_root）
+    if project_root == ".":
+        try:
+            _hist = load_project_history()
+            _last = _hist.get("last_project")
+            if _last and os.path.isdir(_last):
+                _state["project_root"] = _last
+        except Exception:
+            pass
 
     # --- Auth middleware ---
     @app.middleware("http")
@@ -847,6 +849,124 @@ def create_app(
         return {"points": managers["rtt"].get_history()}
 
     # ===================================================================
+    # Integrated Dashboard SSE — SystemView（RTOS 跟踪）
+    # ===================================================================
+
+    @app.get("/api/dash/systemview/stream")
+    async def systemview_sse_stream():
+        """SSE endpoint for real-time SystemView RTOS-trace events."""
+        from starlette.responses import StreamingResponse
+        managers = get_managers()
+        sv = managers["systemview"]
+        if not sv.running:
+            raise HTTPException(status_code=400, detail="SystemView stream not started")
+        return StreamingResponse(
+            sv.sse_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/api/dash/systemview/start")
+    async def systemview_start(
+        addr: str | None = Body(default=None),
+        channel: int = Body(default=1),
+        mode: int = Body(default=0),
+        search_size: int = Body(default=1024),
+    ):
+        if mode not in (0, 1):
+            raise HTTPException(
+                status_code=400,
+                detail=f"mode 必须是 0 或 1，得到 {mode}",
+            )
+        if not _state["device"] or not _state["device"].connected:
+            raise HTTPException(status_code=400, detail="Device not connected")
+        from mklink.remote.dashboards import stop_bridge_dashboards
+        stopped = stop_bridge_dashboards(exclude="systemview")
+        rm = _state["resource_manager"]
+        for name in stopped:
+            rm.release(f"user:dashboard:{name}")
+        rm.acquire(ResourceGroup.MKLINK_BRIDGE, "user:dashboard:systemview", preempt=True)
+        managers = get_managers()
+        sv = managers["systemview"]
+        if sv.running:
+            return {"status": "already_running"}
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: sv.start(
+                _state["device"],
+                addr=addr,
+                channel=channel,
+                mode=mode,
+                search_size=search_size,
+            ),
+        )
+        return {"status": "started", "stopped": stopped}
+
+    @app.post("/api/dash/systemview/stop")
+    async def systemview_stop():
+        managers = get_managers()
+        managers["systemview"].stop()
+        _state["resource_manager"].release("user:dashboard:systemview")
+        return {"status": "stopped"}
+
+    @app.post("/api/dash/systemview/pause")
+    async def systemview_pause():
+        managers = get_managers()
+        managers["systemview"].pause()
+        return {"status": "paused"}
+
+    @app.post("/api/dash/systemview/resume")
+    async def systemview_resume():
+        managers = get_managers()
+        managers["systemview"].resume()
+        return {"status": "running"}
+
+    @app.get("/api/dash/systemview/status")
+    async def systemview_status():
+        managers = get_managers()
+        return managers["systemview"].get_status()
+
+    @app.get("/api/dash/systemview/history")
+    async def systemview_history():
+        managers = get_managers()
+        return {"points": managers["systemview"].get_history()}
+
+    @app.get("/api/dash/systemview/logs")
+    async def systemview_logs():
+        from mklink.systemview_logs import list_systemview_logs
+
+        return {"logs": list_systemview_logs(_state["project_root"])}
+
+    @app.get("/api/dash/systemview/logs/download")
+    async def systemview_log_download(path: str = Query(...)):
+        from fastapi.responses import FileResponse
+        from mklink.systemview_logs import (
+            SystemViewLogPathError,
+            resolve_systemview_log_download,
+        )
+
+        try:
+            resolved = resolve_systemview_log_download(
+                _state["project_root"], path,
+            )
+        except SystemViewLogPathError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="SystemView log not found")
+
+        media_type = (
+            "application/x-ndjson"
+            if resolved.suffix.lower() == ".jsonl"
+            else "text/plain; charset=utf-8"
+        )
+        return FileResponse(
+            resolved,
+            media_type=media_type,
+            filename=resolved.name,
+        )
+
+    # ===================================================================
     # Integrated Dashboard SSE — SuperWatch
     # ===================================================================
 
@@ -1192,7 +1312,7 @@ def create_app(
 
     @app.post("/api/dash/vofa/start")
     async def vofa_start(
-        channels: list[dict] = Body(...),
+        channels: list[dict] | None = Body(default=None),
         interval: float = Body(default=0.1),
     ):
         """Start VOFA JustFloat streaming.
@@ -1212,11 +1332,18 @@ def create_app(
         vm = managers["vofa"]
         if vm.running:
             return {"status": "already_running"}
+        if not channels:
+            channels = list(getattr(vm, "_channels", []) or [])
+        if not channels:
+            raise HTTPException(
+                status_code=400,
+                detail="VOFA channels are required before starting",
+            )
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None, lambda: vm.start(_state["device"], channels, interval)
         )
-        return {"status": "started", "stopped": stopped}
+        return {"status": "started", "stopped": stopped, "channels": channels}
 
     @app.post("/api/dash/vofa/stop")
     async def vofa_stop():

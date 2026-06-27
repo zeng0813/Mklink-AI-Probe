@@ -260,8 +260,9 @@ def load_dwarf_info(source: str, *, use_cache: bool = True) -> DwarfInfo:
         cached = cache.load(source)
         if cached:
             return cached
+    from mklink.toolchain import require_readelf
     result = subprocess.run(
-        ["arm-none-eabi-readelf", "--debug-dump=info", source],
+        [require_readelf(), "--debug-dump=info", source],
         capture_output=True,
         text=True,
         timeout=60,

@@ -13,13 +13,23 @@
           @stop="onStop"
         />
         <span v-if="logLines.length > 0" class="line-count">{{ logLines.length }} 行</span>
-        <button v-if="logLines.length > 0" class="btn-clear" @click="clearLogs">清除</button>
+        <button v-if="logLines.length > 0" class="btn-clear" @click="clearLogs()">清除</button>
         <label v-if="dash.state.value === 'running'" class="auto-scroll-toggle">
           <input type="checkbox" v-model="autoScroll" />
           自动滚动
         </label>
       </div>
-      <div class="rtt-view-log" ref="logBody" @scroll="onScroll">
+      <div
+        class="rtt-view-log"
+        ref="logBody"
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions text"
+        aria-atomic="false"
+        aria-label="RTT View log"
+        tabindex="0"
+        @scroll="onScroll"
+      >
         <div v-for="line in logLines" :key="line.num" class="rtt-log-line">
           <span class="line-num">{{ line.num }}</span>
           <span class="timestamp">{{ line.ts }}</span>
@@ -36,6 +46,7 @@ import { ref, watch, nextTick } from 'vue'
 import { useDashboard } from '../../composables/useDashboard'
 import { useEventSource } from '../../composables/useEventSource'
 import { useResourceStatus } from '../../composables/useResourceStatus'
+import { takeNewStreamPoints } from '../../lib/streamCursor'
 import ControlToolbar from './ControlToolbar.vue'
 
 interface LogLine {
@@ -56,7 +67,9 @@ const autoScroll = ref(true)
 const streamEnded = ref(false)
 const logBody = ref<HTMLElement | null>(null)
 let lineCounter = 0
+let lastStreamSeq = 0
 const MAX_LINES = 5000
+const SCROLL_FOLLOW_THRESHOLD = 24
 
 const DASH_NAMES: Record<string, string> = {
   rtt: 'RTT', superwatch: 'SuperWatch', vofa: 'VOFA+',
@@ -95,10 +108,27 @@ function addLine(text: string, type: LogLine['type'], t?: number) {
   }
 }
 
-watch(data, (newData, oldData) => {
-  const start = oldData?.length || 0
-  for (let i = start; i < newData.length; i++) {
-    const dp = newData[i] as any
+function isNearBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= SCROLL_FOLLOW_THRESHOLD
+}
+
+function scrollToBottom() {
+  if (!logBody.value) return
+  logBody.value.scrollTop = logBody.value.scrollHeight
+}
+
+function latestBufferedStreamSeq(): number {
+  return (data.value as any[]).reduce((latest, point) => {
+    const seq = point?._streamSeq
+    return typeof seq === 'number' && seq > latest ? seq : latest
+  }, lastStreamSeq)
+}
+
+// SSE data is bounded, so array length can stay constant while new points arrive.
+// Use monotonic stream sequence numbers instead of length-based diffing.
+watch(data, (newData) => {
+  const fresh = takeNewStreamPoints(newData as any[], lastStreamSeq)
+  for (const dp of fresh.points as any[]) {
     const evt = dp.event || dp._event
     const t = dp._t as number | undefined
     if (evt === 'raw') {
@@ -107,14 +137,15 @@ watch(data, (newData, oldData) => {
       addLine(formatDataEvent(dp as Record<string, unknown>), 'data', t)
     }
   }
+  lastStreamSeq = fresh.nextSeq
   if (autoScroll.value) {
-    nextTick(() => {
-      if (logBody.value) {
-        logBody.value.scrollTop = logBody.value.scrollHeight
-      }
-    })
+    nextTick(scrollToBottom)
   }
-}, { deep: true })
+})
+
+watch(autoScroll, (enabled) => {
+  if (enabled) nextTick(scrollToBottom)
+})
 
 watch(sseConnected, (now, was) => {
   if (was && !now && dash.state.value === 'running') {
@@ -125,16 +156,15 @@ watch(sseConnected, (now, was) => {
 
 function onScroll() {
   if (!logBody.value) return
-  const { scrollTop, scrollHeight, clientHeight } = logBody.value
-  if (scrollHeight - scrollTop - clientHeight > 50) {
-    autoScroll.value = false
-  }
+  autoScroll.value = isNearBottom(logBody.value)
 }
 
-function clearLogs() {
+function clearLogs(options: { resetCursor?: boolean } = {}) {
   logLines.value = []
   lineCounter = 0
+  lastStreamSeq = options.resetCursor ? 0 : latestBufferedStreamSeq()
   streamEnded.value = false
+  autoScroll.value = true
 }
 
 async function onStart() {
@@ -143,7 +173,7 @@ async function onStart() {
     const names = conflicts.map(c => DASH_NAMES[c] || c).join('、')
     if (!confirm(`启动 RTT 将停止当前运行的 ${names} 会话。确认？`)) return
   }
-  clearLogs()
+  clearLogs({ resetCursor: true })
   await dash.start()
   setTimeout(() => {
     connect()
@@ -161,6 +191,9 @@ async function onStop() {
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 .alert-warn { color: var(--warn); padding: 8px; border: 1px solid var(--warn); border-radius: 4px; }
 .rtt-view-toolbar {
@@ -168,6 +201,9 @@ async function onStop() {
   align-items: center;
   gap: 8px;
   padding: 6px 0;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .line-count {
   color: var(--muted);
@@ -197,36 +233,49 @@ async function onStop() {
   user-select: none;
 }
 .rtt-view-log {
-  flex: 1;
-  min-height: 0;
+  flex: 1 1 auto;
+  min-height: 160px;
+  min-width: 0;
+  width: 100%;
   margin-top: 8px;
   background: #1e1e1e;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 8px;
-  overflow-y: auto;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.6;
   color: #ccc;
 }
+.rtt-view-log:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .rtt-log-line {
   display: flex;
-  gap: 8px;
+  gap: 10px;
   align-items: baseline;
-  white-space: pre-wrap;
-  word-break: break-all;
+  width: max-content;
+  min-width: 100%;
+  white-space: pre;
 }
 .line-num {
-  min-width: 50px;
+  flex: 0 0 50px;
   text-align: right;
   color: var(--dim);
   user-select: none;
 }
 .timestamp {
-  min-width: 90px;
+  flex: 0 0 92px;
   color: var(--dim);
   user-select: none;
+}
+.line-content {
+  flex: 0 0 auto;
+  white-space: pre;
 }
 .line-content.data {
   color: #8be9fd;

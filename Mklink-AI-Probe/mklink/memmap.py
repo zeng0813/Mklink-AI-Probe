@@ -48,7 +48,8 @@ def summarize_sections(sections: list[Section], *, flash_size: int = 0, ram_size
 
 
 def analyze_memmap(source: str, *, flash_size: int = 0, ram_size: int = 0) -> dict:
-    result = subprocess.run(["arm-none-eabi-readelf", "-S", source], capture_output=True, text=True, timeout=30)
+    from mklink.toolchain import require_readelf
+    result = subprocess.run([require_readelf(), "-S", source], capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "readelf -S failed")
     return summarize_sections(parse_section_headers(result.stdout), flash_size=flash_size, ram_size=ram_size)

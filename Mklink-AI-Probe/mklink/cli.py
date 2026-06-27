@@ -93,7 +93,8 @@ def _cli_project_init(project_root: str):
     from mklink.iar_parser import find_ewp, parse_ewp
     from mklink.profiles import load_mcu_profiles, match_mcu_by_device
     from mklink.project_config import (
-        save_config, save_project_info, save_rtt_config, is_configured,
+        save_config, save_project_info, save_rtt_config, save_toolchain_config,
+        is_configured,
     )
     from mklink.discovery import (
         check_flm_on_microkeen, copy_flm_to_microkeen, resolve_keil_flm_path,
@@ -248,6 +249,15 @@ def _cli_project_init(project_root: str):
     print(f"  MCU:      {mcu_key or 'custom'} ({mcu_name})")
     print(f"  RTT:      将在首次使用时检测")
 
+    # readelf / AXF 工具链可用性（符号/变量/HardFault 源码行依赖它，flash/RTT/内存等不需要）
+    from mklink._deps import check_readelf_available
+    readelf_ok, readelf_info = check_readelf_available()
+    if readelf_ok:
+        print(f"  readelf:  {readelf_info} (符号/变量/HardFault 源码行可用)")
+    else:
+        print(f"  readelf:  未找到 — 符号/变量/HardFault 源码行不可用（flash/RTT/内存/Modbus 不受影响）")
+        print(f"            安装：winget install Arm.GnuArmEmbeddedToolchain，或编辑 .mklink/toolchain.json 指向工具路径")
+
     print("=" * 50)
 
     # 自动检测 COM 口
@@ -274,6 +284,13 @@ def _cli_project_init(project_root: str):
         "channel": 0,
         "autostart": False,
         "rtt_storage_mode": 0,
+    })
+    # 保存 toolchain.json 模板（可选：覆盖 GNU Arm 工具链路径；留空则按 PATH/常见位置自动解析）
+    save_toolchain_config(project_root, {
+        "readelf": "",
+        "addr2line": "",
+        "_doc": "可选：覆盖 GNU Arm 工具链路径。留空 = 按 PATH/常见安装位置自动解析。"
+                "示例：C:/tools/arm-gnu/bin/arm-none-eabi-readelf.exe",
     })
 
     # 探针固件版本检查（不阻塞 init）
@@ -489,6 +506,94 @@ def _cli_rtt(
             print(f"\n[OK] RTT 会话结束")
 
 
+def _format_systemview_event(ev: dict) -> str:
+    """把单个 SystemView 事件格式化成单行控制台输出。"""
+    kind = ev.get("kind", "?")
+    t = ev.get("t_ticks", 0)
+    tus = ev.get("t_us")
+    tstamp = f"{tus:,.0f}us" if tus is not None else f"{t}tk"
+    name = ev.get("task_name") or ev.get("isr_name") or ""
+    extras = []
+    if "task_id" in ev:
+        extras.append(f"id=0x{ev['task_id']:X}")
+    if "isr_id" in ev:
+        extras.append(f"#={ev['isr_id']}")
+    if "cause" in ev:
+        extras.append(f"cause={ev['cause']}")
+    if "user_id" in ev:
+        extras.append(f"user={ev['user_id']}")
+    tail = " ".join([n for n in [name] if n] + extras)
+    return f"[t={tstamp}] {kind:<18} {tail}".rstrip()
+
+
+def _cli_systemview(
+    project_root: str,
+    port: str | None,
+    duration: float,
+    channel: int = 1,
+    addr: str | None = None,
+    visualize: bool = False,
+):
+    """一站式 SystemView RTOS 跟踪：连接 → 启动 → 解码打印事件。
+
+    需要目标工程已集成 SEGGER_SYSVIEW（先运行 ``python -m mklink
+    systemview-integrate --project-root .``）。控制台模式实时打印解码出
+    的 RTOS 事件；可视化请用 ``mklink gui`` 打开 Dashboard 的 RTOS Trace Tab。
+    """
+    import time
+    import mklink
+    from mklink.project_config import ensure_rtt_config_updated
+
+    # 与 RTT 共用 RTT 地址，自动更新
+    ensure_rtt_config_updated(project_root)
+
+    print(f"[*] 连接 MKLink（端口: {port or '自动检测'}）...")
+    try:
+        dev = mklink.connect(port=port, project_root=project_root)
+    except Exception as e:
+        print(f"[FAIL] 连接失败: {e}")
+        return
+    print("[OK] 连接成功")
+
+    if visualize:
+        print("[*] SystemView 可视化请在 GUI 中查看：运行 `mklink gui`，")
+        print("    打开 Dashboard → 'RTOS Trace' Tab（SSE: /api/dash/systemview/stream）。")
+        dev.close()
+        return
+
+    try:
+        result = dev.systemview_start(addr=addr, channel=channel)
+    except Exception as e:
+        print(f"[FAIL] SystemView 启动失败: {e}")
+        dev.close()
+        return
+
+    if not result.get("control_block_addr"):
+        print("[FAIL] 未找到 RTT 控制块——请确认已集成 RTT 并烧录运行")
+        dev.close()
+        return
+
+    print(f"[OK] SystemView 已启动 (RTT 控制块: {result['control_block_addr']}, "
+          f"通道: {channel})")
+    print(f"[*] 解码 RTOS 事件 {duration} 秒（Ctrl+C 中断）...\n")
+
+    start = time.time()
+    try:
+        while time.time() - start < duration:
+            res = dev.systemview_read(duration=0.5)
+            for ev in res.get("events", []):
+                print(_format_systemview_event(ev))
+    except KeyboardInterrupt:
+        print("\n[*] 用户中断")
+    finally:
+        try:
+            dev.systemview_stop()
+        except Exception:
+            pass
+        dev.close()
+        print(f"\n[OK] SystemView 会话结束")
+
+
 def _cli_copy_flm(project_root: str):
     """拷贝 FLM 文件到 MICROKEEN 磁盘。"""
     from mklink.project_config import load_project_info
@@ -658,6 +763,169 @@ def _find_and_save_rtt_addr(project_root: str) -> None:
     else:
         print("[!] 未找到 MAP 文件，无法自动获取 RTT 地址")
 
+
+
+def _cli_systemview_analyze(project_root: str, port: str | None, duration: float):
+    """采集 SystemView 跟踪并打印 RTOS 运行态分析报告。"""
+    import mklink
+    from mklink.project_config import ensure_rtt_config_updated
+    from mklink.systemview_analyzer import analyze_events, format_report
+
+    ensure_rtt_config_updated(project_root)
+    # 自动加载 axf（读 SystemCoreClock 做 µs 换算 + 任务名解析需要符号）
+    from pathlib import Path
+    axf = None
+    for p in Path(project_root).glob("build/**/*.axf"):
+        axf = str(p); break
+    print(f"[*] 连接 MKLink（端口: {port or '自动检测'}）…" + (f"  axf={axf}" if axf else "  [WARN] 未找到 axf，将无法换算 µs"))
+    try:
+        dev = mklink.connect(port=port, project_root=project_root, axf=axf)
+    except Exception as e:
+        print(f"[FAIL] 连接失败: {e}")
+        return
+    print("[OK] 连接成功")
+    try:
+        dev.systemview_start()
+    except Exception as e:
+        print(f"[FAIL] SystemView 启动失败: {e}")
+        dev.close()
+        return
+    print(f"[*] 采集 {duration}s 跟踪并分析…")
+    try:
+        result = dev.systemview_read(duration=duration)
+        dev.systemview_stop()
+        # 任务名解析：直接读 RT-Thread rt_thread.name 字段（不依赖开机 INIT 包）
+        ids = list({e["task_id"] for e in result.get("events", []) if "task_id" in e})
+        if ids:
+            try:
+                names = dev.systemview_resolve_task_names(ids)
+                if names:
+                    for e in result["events"]:
+                        if e.get("task_id") in names:
+                            e["task_name"] = names[e["task_id"]]
+            except Exception:
+                pass
+    finally:
+        try:
+            dev.systemview_stop()
+        except Exception:
+            pass
+        dev.close()
+    report = analyze_events(result.get("events", []))
+    print(format_report(report))
+
+
+def _cli_systemview_report(
+    project_root: str,
+    port: str | None,
+    duration: float,
+    out_path: str,
+    no_browser: bool,
+):
+    """采集 SystemView 并生成自包含 HTML 可视化分析报告。"""
+    import mklink
+    from pathlib import Path
+    from mklink.project_config import ensure_rtt_config_updated
+    from mklink.systemview_analyzer import analyze_events
+    from mklink.systemview_report import generate_html_report
+
+    ensure_rtt_config_updated(project_root)
+    axf = next(Path(project_root).glob("build/**/*.axf"), None)
+    axf = str(axf) if axf else None
+    print(f"[*] 连接 MKLink（端口: {port or '自动检测'}）…")
+    try:
+        dev = mklink.connect(port=port, project_root=project_root, axf=axf)
+    except Exception as e:
+        print(f"[FAIL] 连接失败: {e}")
+        return
+    print("[OK] 连接成功")
+    try:
+        dev.systemview_start()
+    except Exception as e:
+        print(f"[FAIL] SystemView 启动失败: {e}")
+        dev.close()
+        return
+    print(f"[*] 采集 {duration}s 生成报告…")
+    events: list = []
+    try:
+        result = dev.systemview_read(duration=duration)
+        events = result.get("events", [])
+        dev.systemview_stop()
+        # 任务名解析
+        ids = list({e["task_id"] for e in events if "task_id" in e})
+        if ids:
+            try:
+                names = dev.systemview_resolve_task_names(ids)
+                for e in events:
+                    if e.get("task_id") in names:
+                        e["task_name"] = names[e["task_id"]]
+            except Exception:
+                pass
+    finally:
+        try:
+            dev.systemview_stop()
+        except Exception:
+            pass
+        dev.close()
+
+    report = analyze_events(events)
+    meta = {"cpu_freq": result.get("cpu_freq") if "result" in dir() else 0}
+    html_str = generate_html_report(
+        report, events, meta=meta, title=f"SystemView RTOS 报告 — {Path(project_root).name}"
+    )
+    out = Path(out_path).resolve()
+    out.write_text(html_str, encoding="utf-8")
+    print(f"\n[OK] 报告已生成: {out}  ({len(events)} 事件, {report['summary'].get('task_count',0)} 任务)")
+    if not no_browser:
+        try:
+            import webbrowser
+            webbrowser.open(out.as_uri())
+            print("[*] 已在浏览器打开")
+        except Exception:
+            pass
+
+
+def _cli_systemview_integrate(project_root: str, sv_dir: str = "segger_systemview"):
+    """集成 SEGGER SystemView 到 RT-Thread 项目（克隆 rtt-integrate 思路）。
+
+    复制 SEGGER_SYSVIEW 源到 sv_dir → 注册 Keil 工程 + IncludePath →
+    main.c 加 include → 加 USE_SYSTEMVIEW 宏。RT-Thread 启动时自动初始化并
+    开始把事件写入 RTT 通道 1。任何步骤失败自动回滚。
+    """
+    from mklink.systemview_integration import (
+        check_systemview_sources_bundled, full_systemview_integrate,
+        generate_systemview_usage_example,
+    )
+    if not check_systemview_sources_bundled():
+        print("[FAIL] 技能目录中缺少 SystemView 源文件 (systemview_sources/)")
+        return
+
+    print(f"[*] 集成 SystemView 到 {project_root} ...")
+    result = full_systemview_integrate(project_root, sv_dir=sv_dir)
+
+    def _step(label, key):
+        r = result.get(key)
+        if not r:
+            return
+        ok = r.get("success", r.get("macro_added", False))
+        print(f"[{'OK' if ok else 'FAIL'}] {label}")
+        for e in r.get("errors", []):
+            print(f"       - {e}")
+
+    _step("复制 SystemView 源文件", "copy")
+    _step("注册到 Keil 工程 + IncludePath", "keil")
+    if result.get("main", {}).get("added"):
+        print("[OK] main.c 注入 #include \"SEGGER_SYSVIEW.h\"（USE_SYSTEMVIEW 守卫）")
+    _step("添加 USE_SYSTEMVIEW 宏", "macro")
+
+    if result["success"]:
+        print("\n[OK] SystemView 集成完成。下一步：重新编译烧录，再运行 "
+              "`python -m mklink systemview --duration 10`")
+        print(generate_systemview_usage_example())
+    else:
+        print("\n[FAIL] SystemView 集成未完成：")
+        for e in result.get("errors", []):
+            print(f"  - {e}")
 
 
 def _cli_rtt_integrate(
@@ -1235,21 +1503,43 @@ def _parse_flush_item(raw: str) -> tuple[int, list[int]]:
       - 逗号分隔无前缀：      "0x20010000:11,22,33"
       - 空格分隔 + 0x 前缀：  "0x20010000:0x11 0x22 0x33"
       - 混合：                "0x20010000:0x11 0x22,0x33"
+      - 单字节重复（推荐大块/填充）： "0x20008000:0xAA*16300"
+        * 绕开 Windows 命令行长度限制（实测逐字节展开 ≈16KB 即撞墙）；
+        * 复用固件 bytes([0xVV])*N 短表达式，命令串极短，单次可写数 KB；
+        * count 为十进制；byte 接受 0xAA / AA。
 
     Returns:
         (addr_int, [byte_int, ...])
 
     Raises:
-        ValueError: 解析失败
+        ValueError: 解析失败（含 BYTE*N 与逐字节列表混排）
     """
     if ":" not in raw:
-        raise ValueError(f"缺少 ':' 分隔 addr 与 data（格式: ADDR:BYTE,BYTE,...）")
+        raise ValueError(f"缺少 ':' 分隔 addr 与 data（格式: ADDR:BYTE,BYTE,... 或 ADDR:BYTE*N）")
     addr_part, data_part = raw.split(":", 1)
     addr_int = int(addr_part.strip(), 16)
     # 同时接受逗号和空格分隔
     tokens = [t for t in data_part.replace(",", " ").split() if t]
     if not tokens:
         raise ValueError(f"data 部分为空（至少 1 字节）")
+    # BYTE*N 单字节重复形式：必须是单一 token 且含且仅含一个 '*'
+    if any("*" in t for t in tokens):
+        if len(tokens) != 1 or tokens[0].count("*") != 1:
+            raise ValueError(
+                "BYTE*N 形式必须是单一 'BYTE*COUNT'（如 0xAA*16300），"
+                "不能与逐字节列表混排"
+            )
+        byte_spec, _, count_spec = tokens[0].partition("*")
+        try:
+            byte_val = int(byte_spec, 16)
+            count = int(count_spec)
+        except ValueError:
+            raise ValueError(f"无法解析 BYTE*N: {tokens[0]!r}（byte 用 0x-AA，count 为十进制）")
+        if not (0 <= byte_val <= 0xFF):
+            raise ValueError(f"BYTE*N 的字节超出 0..0xFF: {byte_spec!r}")
+        if count < 1:
+            raise ValueError(f"BYTE*N 的 count 必须 ≥1: {count}")
+        return addr_int, [byte_val] * count
     byte_list = [int(t, 16) for t in tokens]
     return addr_int, byte_list
 
@@ -1329,7 +1619,8 @@ def _cli_flush_memory(
         print(f"       {len(parsed)} 个地址 / 共 {total_bytes} 字节（非重复数据展开为字面量）。")
         print(f"       超长命令会触发固件 PIKA_LINE_BUFF 溢出 → REPL 挂起 → 端口死锁（需拔插复位）。")
         print(f"       请分块：每块 ≤ 30 字节展开（实测 32B 安全）/ ≤8 地址项，每批等 REPL 返回 >>> 再发下一批；")
-        print(f"       全相同字节（清零/填 0xFF 等）已自动用短表达式，可一次写 ≤12KB。")
+        print(f"       全相同字节（清零/填 0xFF 等）请改用 ADDR:BYTE*N 紧凑语法（如 0x20008000:0xAA*16300），")
+        print(f"       CLI 自动转 bytes([0xVV])*N 短表达式，命令串极短、绕开 Windows 命令行长度限制，可一次写数 KB。")
         return
 
     # 3) 连接并执行
@@ -1707,9 +1998,15 @@ def _cli_symbols(source: str, filter_pattern: str | None):
     import subprocess
 
     from mklink.symbol_parser import parse_readelf_output, filter_symbols
+    from mklink.toolchain import resolve_readelf
 
     # Run readelf to get symbol table
-    cmd = ["arm-none-eabi-readelf", "-s", source]
+    tool = resolve_readelf()
+    if not tool:
+        print("[FAIL] arm-none-eabi-readelf 未找到（PATH / MKLINK_READELF / .mklink/toolchain.json）")
+        print("       安装 GNU Arm 工具链，例如：winget install Arm.GnuArmEmbeddedToolchain")
+        return
+    cmd = [tool, "-s", source]
 
     try:
         result = subprocess.run(
@@ -1718,10 +2015,6 @@ def _cli_symbols(source: str, filter_pattern: str | None):
             text=True,
             timeout=30,
         )
-    except FileNotFoundError:
-        print("[FAIL] arm-none-eabi-readelf not found on PATH")
-        print("       Install ARM GCC toolchain or add to PATH")
-        return
     except subprocess.TimeoutExpired:
         print("[FAIL] readelf command timed out")
         return
@@ -2933,27 +3226,34 @@ def _cli_break(args):
                 return
 
             import subprocess
+            import shutil
             from mklink.symbol_parser import resolve_function_address
-            try:
+            from mklink.toolchain import resolve_readelf
+
+            tool = resolve_readelf()
+            if tool:
                 result = subprocess.run(
-                    ["arm-none-eabi-readelf", "-s", source],
+                    [tool, "-s", source],
                     capture_output=True, text=True, timeout=10
                 )
                 if result.returncode != 0:
                     print(f"[FAIL] readelf 失败: {result.stderr.strip()}")
                     return
                 address = resolve_function_address(result.stdout, target)
-            except FileNotFoundError:
-                # Try fromelf for ARM Compiler
-                try:
+            else:
+                # 无 GNU readelf —— 回退到 Keil ARM Compiler 的 fromelf
+                result = None
+                address = None
+                if shutil.which("fromelf"):
                     result = subprocess.run(
                         ["fromelf", "--text", "-s", source],
                         capture_output=True, text=True, timeout=10
                     )
                     if result.returncode == 0:
                         address = resolve_function_address(result.stdout, target)
-                except FileNotFoundError:
+                if result is None:
                     print("[FAIL] 未找到 arm-none-eabi-readelf 或 fromelf")
+                    print("       安装 GNU Arm 工具链: winget install Arm.GnuArmEmbeddedToolchain")
                     return
 
             if address is None:
@@ -3060,6 +3360,17 @@ def _cli_serve(args):
         )
 
 
+def _cli_mcp(args):
+    """启动 MCP (Model Context Protocol) server。
+
+    暴露 mklink 能力为 vendor-neutral tool（能力层 = mklink.mcp_server，
+    编排方法论 = SKILL.md）。使用 stdio transport：严禁向 stdout 输出任何
+    内容（该流承载 JSON-RPC 协议）；诊断信息走 stderr / logging。
+    """
+    from mklink.mcp_server import run as run_mcp_server
+    run_mcp_server()
+
+
 def main():
     """CLI 入口，首先执行依赖检查。"""
     # Windows 控制台 UTF-8 支持
@@ -3136,6 +3447,17 @@ def main():
              "更新 scatter 加 RW_IRAM_RTT 段。任何步骤失败自动回滚。"
     )
 
+    # systemview-integrate 子命令（RTOS 跟踪集成）
+    sv_int_parser = subparsers.add_parser(
+        "systemview-integrate",
+        help="集成 SEGGER SystemView 到 RT-Thread 项目（RTOS 跟踪，跑在 RTT 通道 1）",
+    )
+    _add_project_root_arg(sv_int_parser)
+    sv_int_parser.add_argument(
+        "--sv-dir", default="segger_systemview",
+        help="SystemView 源文件存放目录（默认 segger_systemview）",
+    )
+
     # copy-flm 子命令
     copy_flm_parser = subparsers.add_parser("copy-flm", help="拷贝 FLM 文件到 MICROKEEN 磁盘")
     _add_project_root_arg(copy_flm_parser)
@@ -3157,6 +3479,38 @@ def main():
     rtt_cmd_parser.add_argument("--port-http", type=int, default=0, help="HTTP 服务器端口（默认 0 = 随机）")
     rtt_cmd_parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     rtt_cmd_parser.add_argument("--source", help="ELF/AXF path accepted for HIL smoke compatibility")
+
+    # systemview 子命令（RTOS 跟踪：RTT 通道 1 → SEGGER 事件解码）
+    sv_parser = subparsers.add_parser(
+        "systemview",
+        help="SystemView RTOS 跟踪（RTT 通道 1 → 解码任务切换/ISR/CPU 占用）",
+    )
+    _add_project_root_arg(sv_parser)
+    sv_parser.add_argument("--port", help="COM 端口（默认自动检测）")
+    sv_parser.add_argument("--duration", type=float, default=10.0, help="读取时长（秒，默认 10）")
+    sv_parser.add_argument("--channel", type=int, default=1, help="SystemView 上行通道（SEGGER 默认 1）")
+    sv_parser.add_argument("--addr", help="RTT 控制块地址（默认从 rtt_config.json 读）")
+    sv_parser.add_argument("--visualize", action="store_true", help="提示用 mklink gui 查看可视化")
+
+    # systemview-analyze 子命令（采集 + RTOS 运行态分析报告）
+    sv_an_parser = subparsers.add_parser(
+        "systemview-analyze",
+        help="采集 SystemView 并打印 RTOS 运行态分析（CPU%%/切换/ISR/异常）",
+    )
+    _add_project_root_arg(sv_an_parser)
+    sv_an_parser.add_argument("--port", help="COM 端口（默认自动检测）")
+    sv_an_parser.add_argument("--duration", type=float, default=6.0, help="采集时长（秒，默认 6）")
+
+    # systemview-report 子命令（生成 HTML 可视化分析报告）
+    sv_rep_parser = subparsers.add_parser(
+        "systemview-report",
+        help="采集 SystemView 并生成自包含 HTML 可视化分析报告",
+    )
+    _add_project_root_arg(sv_rep_parser)
+    sv_rep_parser.add_argument("--port", help="COM 端口（默认自动检测）")
+    sv_rep_parser.add_argument("--duration", type=float, default=6.0, help="采集时长（秒，默认 6）")
+    sv_rep_parser.add_argument("--out", default="systemview_report.html", help="输出 HTML 路径")
+    sv_rep_parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
 
     # read-ram 子命令
     read_ram_parser = subparsers.add_parser("read-ram", help="读取目标芯片 RAM 数据")
@@ -3238,7 +3592,9 @@ def main():
         "items", nargs="+",
         help='写入项，格式 "ADDR:BYTE,BYTE,..."，可传多项\n'
              '  字节接受 0x11 / 11，逗号或空格分隔\n'
-             '  例: 0x20010000:0x11,0x22,0x33  0x20010100:0x44,0x55,0x66,0x77',
+             '  例: 0x20010000:0x11,0x22,0x33  0x20010100:0x44,0x55,0x66,0x77\n'
+             '  单字节重复（清零/填 0xFF/大块填充）用 ADDR:BYTE*N：\n'
+             '       0x20008000:0xAA*16300  （绕开 Windows 命令行长度限制）',
     )
     flush_memory_parser.add_argument(
         "--verify", action="store_true", help="写完后回读校验（消耗额外时间）"
@@ -3588,6 +3944,12 @@ def main():
     gui_parser.add_argument("--axf", default=None, help="AXF/ELF 文件路径")
     gui_parser.add_argument("--project-root", default=".", help="项目根目录")
 
+    # mcp 子命令（MCP server，stdio transport）
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="启动 MCP (Model Context Protocol) server（stdio，供 Claude Code / 其他 MCP client 调用）",
+    )
+
     # 向后兼容：--test 标志
     parser.add_argument("--port", help="COM 端口（兼容旧版）")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUDRATE)
@@ -3653,6 +4015,8 @@ def main():
             args.src_dir, args.inc_dir, args.force,
             static_addr=getattr(args, "static_addr", None),
         )
+    elif args.command == "systemview-integrate":
+        _cli_systemview_integrate(_resolve_project_root(args), sv_dir=args.sv_dir)
     elif args.command == "copy-flm":
         _cli_copy_flm(_resolve_project_root(args))
     elif args.command == "flash":
@@ -3666,6 +4030,24 @@ def main():
             host=args.host,
             port_http=args.port_http,
             no_browser=args.no_browser,
+        )
+    elif args.command == "systemview":
+        _cli_systemview(
+            _resolve_project_root(args),
+            port=args.port,
+            duration=args.duration,
+            channel=args.channel,
+            addr=args.addr,
+            visualize=args.visualize,
+        )
+    elif args.command == "systemview-analyze":
+        _cli_systemview_analyze(
+            _resolve_project_root(args), port=args.port, duration=args.duration,
+        )
+    elif args.command == "systemview-report":
+        _cli_systemview_report(
+            _resolve_project_root(args), port=args.port, duration=args.duration,
+            out_path=args.out, no_browser=args.no_browser,
         )
     elif args.command == "read-ram":
         _cli_read_ram(args.port, args.addr, args.size, args.save)
@@ -3739,6 +4121,8 @@ def main():
         _cli_serve(args)
     elif args.command == "gui":
         _cli_gui(args)
+    elif args.command == "mcp":
+        _cli_mcp(args)
     else:
         parser.print_help()
 

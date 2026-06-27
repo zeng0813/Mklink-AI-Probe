@@ -1,0 +1,168 @@
+"""Import-friendly JSONL logging for decoded SystemView events."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+
+class SystemViewJsonlLogger:
+    """Write a SystemView capture as line-delimited JSON.
+
+    The file is intentionally append-only and versioned so future tooling can
+    import it without loading the entire trace into memory.
+    """
+
+    schema_version = 1
+
+    def __init__(
+        self,
+        project_root: str,
+        session_meta: dict,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self.started_at = self._normalize_datetime(self._clock())
+        stamp = self.started_at.strftime("%Y%m%d-%H%M%S")
+        log_dir = Path(project_root or ".") / ".mklink" / "logs" / "systemview"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        self.path, self._fh = self._open_unique_trace(log_dir, stamp)
+        self.summary_path = self.path.with_name(f"{self.path.stem}-summary.txt")
+        self._seq = 0
+        self._closed = False
+        self._pending_task_start: dict[int, float] = {}
+        self._task_stats: dict[int, dict] = {}
+
+        session = {
+            "type": "session",
+            "schema": self.schema_version,
+            "started_at": self.started_at.isoformat(),
+            "unit": "us+tk",
+            **(session_meta or {}),
+        }
+        self._write_record(session)
+        self._fh.flush()
+
+    @staticmethod
+    def _open_unique_trace(log_dir: Path, stamp: str):
+        for index in range(1000):
+            suffix = "" if index == 0 else f"-{index}"
+            path = log_dir / f"systemview-{stamp}{suffix}.jsonl"
+            try:
+                return path, path.open("x", encoding="utf-8", newline="\n")
+            except FileExistsError:
+                continue
+        raise FileExistsError(f"too many SystemView captures for {stamp}")
+
+    def write_events(self, events: list[dict]) -> None:
+        if self._closed:
+            return
+        for event in events:
+            self._seq += 1
+            record = {"type": "event", "seq": self._seq, **event}
+            self._write_record(record)
+            self._update_task_stats(event)
+        self._fh.flush()
+
+    def close(self, summary: dict | None = None) -> None:
+        if self._closed:
+            return
+        ended_at = self._normalize_datetime(self._clock())
+        merged_summary = {
+            "type": "summary",
+            "schema": self.schema_version,
+            "started_at": self.started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+            **(summary or {}),
+            "top_tasks": self._top_tasks(),
+        }
+        self._write_record(merged_summary)
+        self._fh.flush()
+        self._fh.close()
+        self._closed = True
+        self._write_text_summary(merged_summary)
+
+    def _write_record(self, record: dict) -> None:
+        self._fh.write(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
+            + "\n"
+        )
+
+    def _update_task_stats(self, event: dict) -> None:
+        task_id = event.get("task_id")
+        if not isinstance(task_id, int):
+            return
+        stats = self._task_stats.setdefault(
+            task_id,
+            {
+                "task_id": task_id,
+                "task_name": event.get("task_name") or "",
+                "run_time": 0.0,
+                "schedules": 0,
+            },
+        )
+        if event.get("task_name") and not stats["task_name"]:
+            stats["task_name"] = event["task_name"]
+
+        timestamp = self._event_time(event)
+        if timestamp is None:
+            return
+        if event.get("kind") == "task_start_exec":
+            self._pending_task_start[task_id] = timestamp
+            stats["schedules"] += 1
+        elif event.get("kind") == "task_stop_exec":
+            start = self._pending_task_start.pop(task_id, None)
+            if start is not None and timestamp >= start:
+                stats["run_time"] += timestamp - start
+
+    def _top_tasks(self) -> list[dict]:
+        return sorted(
+            (
+                {
+                    **stats,
+                    "run_time": round(float(stats["run_time"]), 3),
+                }
+                for stats in self._task_stats.values()
+            ),
+            key=lambda item: item["run_time"],
+            reverse=True,
+        )[:20]
+
+    def _write_text_summary(self, summary: dict) -> None:
+        lines = [
+            "SystemView capture summary",
+            f"started_at: {summary.get('started_at', '')}",
+            f"ended_at: {summary.get('ended_at', '')}",
+            f"events: {summary.get('events', 0)}",
+            f"dropped_bytes: {summary.get('dropped_bytes', 0)}",
+            f"dropped_packets: {summary.get('dropped_packets', 0)}",
+            f"cpu_freq: {summary.get('cpu_freq', 0)}",
+            f"cpu_freq_source: {summary.get('cpu_freq_source', '')}",
+            "",
+            "top_tasks:",
+        ]
+        for task in summary.get("top_tasks", []):
+            name = task.get("task_name") or hex(task.get("task_id", 0))
+            lines.append(
+                f"- {name}: run_time={task.get('run_time', 0)} schedules={task.get('schedules', 0)}"
+            )
+        self.summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _event_time(event: dict) -> float | None:
+        value = event.get("t_us")
+        if isinstance(value, (int, float)):
+            return float(value)
+        value = event.get("t_ticks")
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _normalize_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)

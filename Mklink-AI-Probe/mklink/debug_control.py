@@ -7,6 +7,7 @@ using the existing write-ram / read-ram bridge commands.
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass, field
 
 from mklink.bridge import MKLinkSerialBridge
@@ -19,6 +20,7 @@ DHCSR_KEY = 0xA05F0000
 DHCSR_C_DEBUGEN = 1 << 0
 DHCSR_C_HALT = 1 << 1
 DHCSR_C_STEP = 1 << 2
+DHCSR_S_REGRDY = 1 << 16  # Register read/write transfer complete
 DHCSR_S_HALT = 1 << 17
 DHCSR_S_LOCKUP = 1 << 19
 
@@ -60,6 +62,23 @@ def _write_u32(bridge: MKLinkSerialBridge, addr: int, value: int) -> None:
     b = struct.pack("<I", value)
     cmd = f"cmd.write_ram(0x{addr:08X}, 0x{b[0]:02X}, 0x{b[1]:02X}, 0x{b[2]:02X}, 0x{b[3]:02X})"
     bridge.send_command(cmd, timeout=5.0)
+
+
+def _wait_regrdy(bridge: MKLinkSerialBridge, timeout: float = 0.5) -> None:
+    """Poll DHCSR.S_REGRDY until the DCRSR→DCRDR register transfer completes.
+
+    Mandatory step 2 of the Cortex-M core-register read/write sequence: after
+    writing DCRSR, the core copies the register into DCRDR asynchronously and
+    raises S_REGRDY (bit 16) only when DCRDR holds a valid value. Skipping this
+    poll races the transfer and yields stale/residual DCRDR values when reading
+    multiple registers back-to-back.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if _read_u32(bridge, DHCSR) & DHCSR_S_REGRDY:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("DHCSR.S_REGRDY never asserted after DCRSR write")
 
 
 def read_debug_state(bridge: MKLinkSerialBridge) -> DebugState:
@@ -207,20 +226,16 @@ def resolve_function_address(source: str, name: str) -> int | None:
     """
     import subprocess
     import re
+    from mklink.toolchain import resolve_readelf
 
-    try:
-        result = subprocess.run(
-            ["arm-none-eabi-readelf", "-s", source],
-            capture_output=True, text=True, timeout=10,
-        )
-    except FileNotFoundError:
-        try:
-            result = subprocess.run(
-                ["readelf", "-s", source],
-                capture_output=True, text=True, timeout=10,
-            )
-        except FileNotFoundError:
-            raise RuntimeError("readelf not found — install arm-none-eabi-readelf or binutils")
+    tool = resolve_readelf()
+    if not tool:
+        raise RuntimeError("readelf not found — install arm-none-eabi-readelf or binutils "
+                           "(or set MKLINK_READELF / .mklink/toolchain.json)")
+    result = subprocess.run(
+        [tool, "-s", source],
+        capture_output=True, text=True, timeout=10,
+    )
 
     if result.returncode != 0:
         raise RuntimeError(f"readelf failed: {result.stderr.strip()}")
@@ -248,17 +263,16 @@ def search_functions(source: str, pattern: str, max_results: int = 20) -> list[d
     """
     import subprocess
     import re
+    from mklink.toolchain import resolve_readelf
 
-    try:
-        result = subprocess.run(
-            ["arm-none-eabi-readelf", "-s", source],
-            capture_output=True, text=True, timeout=10,
-        )
-    except FileNotFoundError:
-        result = subprocess.run(
-            ["readelf", "-s", source],
-            capture_output=True, text=True, timeout=10,
-        )
+    tool = resolve_readelf()
+    if not tool:
+        raise RuntimeError("readelf not found — install arm-none-eabi-readelf or binutils "
+                           "(or set MKLINK_READELF / .mklink/toolchain.json)")
+    result = subprocess.run(
+        [tool, "-s", source],
+        capture_output=True, text=True, timeout=10,
+    )
 
     line_re = re.compile(
         r'^\s*\d+:\s+([0-9a-fA-F]+)\s+(\d+)\s+FUNC\s+\S+\s+\S+\s+\S+\s+(.+)$'
@@ -284,46 +298,89 @@ def search_functions(source: str, pattern: str, max_results: int = 20) -> list[d
 
 
 # --- Core Register Access (via DCRSR/DCRDR, requires CPU halted) ---
-DCRSR = 0xE000EDF4  # Debug Core Register Selector
-DCRDR = 0xE000EDF8  # Debug Core Register Data
+DCRSR = 0xE000EDF4  # Debug Core Register Selector Register
+DCRDR = 0xE000EDF8  # Debug Core Register Data Register
 
-# Core register indices for DCRSR
-CORE_REGS = {
+# DCRSR.REGSEL selectors that return a single 32-bit register.
+# Universal across all Cortex-M profiles (v6-M / v7-M / v8-M).
+DIRECT_CORE_REGS = {
     "r0": 0, "r1": 1, "r2": 2, "r3": 3,
     "r4": 4, "r5": 5, "r6": 6, "r7": 7,
     "r8": 8, "r9": 9, "r10": 10, "r11": 11,
     "r12": 12, "sp": 13, "lr": 14, "pc": 15,
     "xpsr": 16, "msp": 17, "psp": 18,
-    "control": 20,
 }
+
+# CONTROL / FAULTMASK / BASEPRI / PRIMASK share a SINGLE DCRSR selector (0x14)
+# and come back packed as the CFBP word:
+#   bits [31:24]=CONTROL  [23:16]=FAULTMASK  [15:8]=BASEPRI  [7:0]=PRIMASK
+# (ARMv7-M ARM DDI 0403 §C1.6.3; cross-checked vs pyOCD cortex_m_core_registers.py).
+# FAULTMASK/BASEPRI read 0 on v6-M (they don't exist there).
+CFBP_SELECTOR = 0x14
+CFBP_CORE_REGS = {
+    "control":   3,  # bits 31:24
+    "faultmask": 2,  # bits 23:16
+    "basepri":   1,  # bits 15:8
+    "primask":   0,  # bits 7:0
+}
+
+# Backward-compatible name → selector map (direct registers only).
+CORE_REGS = dict(DIRECT_CORE_REGS)
+
+
+def _read_core_reg_selector(bridge: MKLinkSerialBridge, selector: int) -> int:
+    """Read one DCRSR selector into DCRDR (REGWnR=0 read). Requires CPU halted."""
+    _write_u32(bridge, DCRSR, selector)
+    _wait_regrdy(bridge)
+    return _read_u32(bridge, DCRDR)
 
 
 def read_core_register(bridge: MKLinkSerialBridge, reg: str | int) -> int:
     """Read a CPU core register (requires CPU halted).
 
     Args:
-        bridge: Connected MKLink bridge
-        reg: Register name (r0-r12, sp, lr, pc, xpsr, msp, psp, control) or index
+        bridge: Connected MKLink bridge.
+        reg: Register name, or a raw DCRSR selector int.
+            Names: r0-r12, sp, lr, pc, xpsr, msp, psp, control, primask,
+            basepri, faultmask. The control/mask names are decoded from the
+            packed CFBP word (selector 0x14), so ``control`` returns the real
+            CONTROL byte, not the whole CFBP word.
+            Raw int: any DCRSR REGSEL, e.g. 0x21=FPSCR, 0x40+n=S{n} on FPU
+            cores — lets callers read platform-specific registers (FPU /
+            security banks) without changing this library.
 
     Returns:
-        32-bit register value
+        32-bit register value (byte-wide, 0-255, for the CFBP mask registers).
     """
     if isinstance(reg, str):
-        idx = CORE_REGS.get(reg.lower())
-        if idx is None:
-            raise ValueError(f"Unknown register '{reg}'. Valid: {', '.join(CORE_REGS.keys())}")
-    else:
-        idx = reg
+        key = reg.lower()
+        if key in DIRECT_CORE_REGS:
+            return _read_core_reg_selector(bridge, DIRECT_CORE_REGS[key])
+        if key in CFBP_CORE_REGS:
+            cfbp = _read_core_reg_selector(bridge, CFBP_SELECTOR)
+            return (cfbp >> (8 * CFBP_CORE_REGS[key])) & 0xFF
+        valid = ", ".join(list(DIRECT_CORE_REGS) + list(CFBP_CORE_REGS))
+        raise ValueError(f"Unknown register '{reg}'. Valid: {valid}")
 
-    # Write register index to DCRSR with REGWnR=0 (read)
-    _write_u32(bridge, DCRSR, idx & 0x1F)
-    # Read result from DCRDR
-    return _read_u32(bridge, DCRDR)
+    # Raw selector passthrough (deliberately no 0x1F mask: FPU regs use 0x21/0x40+).
+    return _read_core_reg_selector(bridge, int(reg))
 
 
 def read_all_core_registers(bridge: MKLinkSerialBridge) -> dict[str, int]:
-    """Read all core registers. Returns dict of name→value."""
-    regs = {}
-    for name, idx in CORE_REGS.items():
-        regs[name] = read_core_register(bridge, idx)
+    """Read the universal Cortex-M core register set.
+
+    Returns name→value for r0-r12, sp, lr, pc, xpsr, msp, psp, control,
+    primask, basepri, faultmask. CFBP is read once and unpacked into the four
+    mask registers.
+
+    Platform-specific extensions (FPU S0-S31 / FPSCR on M4F/M7, security banks
+    on v8-M) are intentionally NOT included — read those via
+    ``read_core_register(<raw selector>)`` from the Skill layer when the target
+    actually has them.
+    """
+    regs = {name: _read_core_reg_selector(bridge, sel)
+            for name, sel in DIRECT_CORE_REGS.items()}
+    cfbp = _read_core_reg_selector(bridge, CFBP_SELECTOR)
+    for name, byte in CFBP_CORE_REGS.items():
+        regs[name] = (cfbp >> (8 * byte)) & 0xFF
     return regs

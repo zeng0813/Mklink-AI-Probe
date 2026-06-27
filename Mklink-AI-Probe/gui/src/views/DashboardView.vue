@@ -1,6 +1,12 @@
 <template>
   <div class="dash-root">
-    <div class="card" :class="{ 'card-full': tab === 'superwatch' || tab === 'vofa' }">
+    <div
+      class="card"
+      :class="{
+        'card-full': tab === 'rtt' || tab === 'superwatch' || tab === 'vofa' || tab === 'systemview',
+        'card-rtt': tab === 'rtt',
+      }"
+    >
       <div class="card-title-row">
         <div class="card-title">仪表盘</div>
         <div class="title-right">
@@ -25,6 +31,7 @@
         <button :class="['tab-btn', { active: tab === 'serial' }]" @click="tab = 'serial'">串口监控</button>
         <button :class="['tab-btn', { active: tab === 'modbus' }]" @click="tab = 'modbus'">Modbus</button>
         <button :class="['tab-btn', { active: tab === 'vofa' }]" @click="tab = 'vofa'">VOFA+</button>
+        <button :class="['tab-btn', { active: tab === 'systemview' }]" @click="tab = 'systemview'">RTOS Trace</button>
       </div>
 
       <RttViewTab v-show="tab === 'rtt'" :device-connected="deviceStatus.connected" />
@@ -74,6 +81,7 @@
       <SerialMonitorTab v-show="tab === 'serial'" :device-connected="deviceStatus.connected" />
       <ModbusTab v-show="tab === 'modbus'" :device-connected="deviceStatus.connected" />
       <VofaTab v-if="tab === 'vofa'" :device-connected="deviceStatus.connected" />
+      <SystemViewTab v-show="tab === 'systemview'" :device-connected="deviceStatus.connected" />
     </div>
   </div>
 </template>
@@ -92,6 +100,7 @@ import SuperWatchTab from '../components/dash/SuperWatchTab.vue'
 import SerialMonitorTab from '../components/dash/SerialMonitorTab.vue'
 import ModbusTab from '../components/dash/ModbusTab.vue'
 import VofaTab from '../components/dash/VofaTab.vue'
+import SystemViewTab from '../components/dash/SystemViewTab.vue'
 
 const router = useRouter()
 const {
@@ -116,6 +125,7 @@ const bridgeOwnerLabel = computed(() => {
     'user:dashboard:rtt': 'RTT View',
     'user:dashboard:superwatch': 'SuperWatch',
     'user:dashboard:vofa': 'VOFA+',
+    'user:dashboard:systemview': 'RTOS Trace',
   }
   return dashNames[owner] || owner
 })
@@ -161,10 +171,19 @@ async function doResume() { try { await resumeDevice(); toast.success('CPU 已�
   flex-direction: column;
   padding-bottom: 0;
   overflow: hidden;
+  min-height: 0;
 }
 .card-full :deep(.waveform-viewer) {
   flex: 1;
   min-height: 0;
+}
+.card-full :deep(.rtt-view-tab) {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.card-rtt {
+  padding-bottom: 16px;
 }
 .card-title-row {
   display: flex;

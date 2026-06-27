@@ -447,17 +447,45 @@ class MKLinkSerialBridge:
         self._ctx.state = DeviceState.READY
         return remaining
 
-    def drain_stream_bytes(self) -> bytes:
-        """读取并清空 VOFA 二进制流缓冲区。
+    def drain_stream_bytes(self, max_bytes: int | None = None) -> bytes:
+        """读取并清空 VOFA / SystemView 二进制流缓冲区。
 
-        仅在 DeviceState.VOFA_STREAM 状态下调用。
+        仅在 VOFA_STREAM / DUMP_STREAM / SYSTEMVIEW_STREAM 状态下调用。
         """
-        if self._ctx.state not in (DeviceState.VOFA_STREAM, DeviceState.DUMP_STREAM):
-            raise RuntimeError("drain_stream_bytes() 仅在 VOFA_STREAM 或 DUMP_STREAM 状态下可用")
+        if self._ctx.state not in (
+            DeviceState.VOFA_STREAM,
+            DeviceState.DUMP_STREAM,
+            DeviceState.SYSTEMVIEW_STREAM,
+        ):
+            raise RuntimeError(
+                "drain_stream_bytes() 仅在 VOFA_STREAM / DUMP_STREAM / "
+                "SYSTEMVIEW_STREAM 状态下可用"
+            )
+        if max_bytes is not None:
+            max_bytes = max(0, int(max_bytes))
+
         with self._buffer_lock:
-            chunks = list(self._response_buffer)
-            self._response_buffer.clear()
-        return b"".join(chunks) if chunks and isinstance(chunks[0], bytes) else b""
+            chunks = self._response_buffer
+            if not chunks or not isinstance(chunks[0], bytes):
+                return b""
+
+            if max_bytes is None:
+                out = list(chunks)
+                chunks.clear()
+                return b"".join(out)
+
+            out: list[bytes] = []
+            remaining = max_bytes
+            while chunks and remaining > 0:
+                chunk = chunks.pop(0)
+                if len(chunk) <= remaining:
+                    out.append(chunk)
+                    remaining -= len(chunk)
+                    continue
+                out.append(chunk[:remaining])
+                chunks.insert(0, chunk[remaining:])
+                remaining = 0
+            return b"".join(out)
 
     def _write_raw(self, data: bytes) -> None:
         """直接写入串口（用于 RTT DownBuffer 等场景）。"""
@@ -494,12 +522,16 @@ class MKLinkSerialBridge:
             )
 
             if is_stream:
-                if self._ctx.state in (DeviceState.VOFA_STREAM, DeviceState.DUMP_STREAM):
-                    # VOFA/DumpMem 二进制流：直接存 bytes，不 decode
+                if self._ctx.state in (
+                    DeviceState.VOFA_STREAM,
+                    DeviceState.DUMP_STREAM,
+                    DeviceState.SYSTEMVIEW_STREAM,
+                ):
+                    # VOFA/DumpMem/SystemView 二进制流：直接存 bytes，不 decode
                     with self._buffer_lock:
                         self._response_buffer.append(data)
                 else:
-                    # RTT/SystemView 文本流：存 str
+                    # RTT 文本流：存 str
                     with self._buffer_lock:
                         self._response_buffer.append(text)
                 line_buf = ""

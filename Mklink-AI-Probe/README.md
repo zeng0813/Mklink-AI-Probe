@@ -62,6 +62,10 @@ pip install -e .
 pip install -e ".[gui]"
 ```
 
+> **AXF 符号解析 / 变量读写 / HardFault 源码行** 需要额外的 `arm-none-eabi-readelf`（GNU Arm 工具链，不随包安装）：`winget install Arm.GnuArmEmbeddedToolchain`。
+> 跑 `project-init` 时会自动检测并在摘要里告诉你；缺失**不影响** flash/RTT/内存/Modbus。
+> 不想加 PATH？用 `.mklink/toolchain.json`（init 会生成模板）或 `MKLINK_READELF` 环境变量指向工具路径。详见 [安装与可选依赖](references/install.md)。
+
 ### 三步上手
 
 ```bash

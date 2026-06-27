@@ -341,12 +341,16 @@ def resolve_variable_names(variables: list[str], elf_path: str | None = None) ->
         return variables
 
     # Run readelf to get symbols
-    cmd = ["arm-none-eabi-readelf", "-s", elf_path]
+    from mklink.toolchain import resolve_readelf
+    tool = resolve_readelf()
+    if not tool:
+        return variables
+    cmd = [tool, "-s", elf_path]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             return variables
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
         return variables
 
     symbols = parse_readelf_output(result.stdout)

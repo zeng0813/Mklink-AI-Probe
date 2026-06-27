@@ -1,0 +1,619 @@
+<template>
+  <div class="sv-tab">
+    <input
+      ref="fileInput"
+      class="sv-file-input"
+      type="file"
+      accept=".jsonl,application/x-ndjson,application/json"
+      @change="onImportFileChange"
+    >
+    <div v-if="!deviceConnected && !offlineMode" class="sv-toolbar sv-offline-toolbar">
+      <button class="btn-clear sv-tool-btn" @click="triggerImport">导入JSONL</button>
+    </div>
+    <div v-if="!deviceConnected && !offlineMode" class="alert alert-warn">请先连接设备。</div>
+    <template v-if="deviceConnected || offlineMode">
+      <!-- 工具栏 + 实时统计 -->
+      <div class="sv-toolbar">
+        <ControlToolbar
+          v-if="!offlineMode"
+          :state="dash.state.value"
+          :error="dash.error.value"
+          :device-connected="deviceConnected"
+          @start="onStart"
+          @pause="dash.pause()"
+          @resume="dash.resume()"
+          @stop="onStop"
+        />
+        <button v-else class="btn-clear sv-mode-btn" @click="returnToLive">实时</button>
+        <button class="btn-clear sv-tool-btn" @click="triggerImport">导入JSONL</button>
+        <button class="btn-clear sv-tool-btn" :disabled="!currentJsonlPath" @click="exportLog(currentJsonlPath)">导出JSONL</button>
+        <button class="btn-clear sv-tool-btn" :disabled="!currentSummaryPath" @click="exportLog(currentSummaryPath)">导出摘要</button>
+        <span v-if="offlineMode" class="sv-stat" :title="offlineFileName">离线 <b>{{ offlineFileName }}</b></span>
+        <span class="sv-stat">事件 <b>{{ eventCount }}</b></span>
+        <span class="sv-stat">任务 <b>{{ taskCount }}</b></span>
+        <span class="sv-stat" :class="{ warn: meta.dropped > 0 }">
+          丢包 <b>{{ meta.dropped }}</b>
+        </span>
+        <span v-if="!meta.synced && dash.state.value === 'running'" class="sv-stat warn">未同步</span>
+        <span v-if="meta.cpuFreq" class="sv-stat" :title="meta.cpuFreqSource || 'cpu_freq'">
+          CPU <b>{{ fmtCpuFreq(meta.cpuFreq) }}</b>
+        </span>
+        <span v-if="analysisBufferCount" class="sv-stat">
+          buffer <b>{{ analysisBufferCount }}</b>
+        </span>
+        <span v-if="importStatus" class="sv-stat" :class="{ warn: importError }">{{ importStatus }}</span>
+        <span v-if="meta.recordingError" class="sv-stat warn">{{ meta.recordingError }}</span>
+        <label class="sv-window">
+          窗口
+          <select v-model.number="windowUs">
+            <option :value="500_000">0.5s</option>
+            <option :value="1_000_000">1s</option>
+            <option :value="2_000_000">2s</option>
+            <option :value="5_000_000">5s</option>
+          </select>
+        </label>
+      </div>
+
+      <!-- CPU 占用条 -->
+      <div class="sv-section">
+        <div class="sv-section-title">CPU 占用（按运行时间排序）</div>
+        <div class="sv-cpu-list">
+          <div v-for="t in tasksSorted" :key="t.id" class="sv-cpu-row">
+            <span class="sv-cpu-name" :title="t.name || hexId(t.id)">{{ t.name || hexId(t.id) }}</span>
+            <div class="sv-cpu-bar-bg">
+              <div class="sv-cpu-bar" :style="{ width: clamp(t.pct) + '%', background: t.color }"></div>
+            </div>
+            <span class="sv-cpu-pct">{{ t.pct.toFixed(1) }}%</span>
+            <span class="sv-cpu-switches" title="task_start_exec count">{{ formatScheduleCount(t.switches) }}</span>
+          </div>
+          <div v-if="tasksSorted.length === 0" class="sv-empty">等待事件…（点 ▶ 开始采集）</div>
+        </div>
+      </div>
+
+      <!-- 甘特时间轴（交互式 canvas：滚轮缩放 · 拖拽平移 · hover · 图例隐藏 · 可见CPU%） -->
+      <div class="sv-section sv-gantt-section">
+        <div class="sv-section-title">
+          任务切换时间轴
+          <span style="font-weight:400;color:var(--dim);font-size:11px">滚轮缩放 · 拖拽平移 · hover 详情 · 点图例隐藏</span>
+          <button class="btn-clear" @click="tlReset">⟲ 全览</button>
+        </div>
+        <div class="sv-legend" ref="tlLegend"></div>
+        <div class="sv-canvas-wrap"><canvas ref="tlCanvas"></canvas></div>
+        <div class="sv-tip" ref="tlTip"></div>
+        <div class="sv-vcpu-title">可见窗口内 CPU 占用</div>
+        <div class="sv-vcpu" ref="tlVcpu"></div>
+      </div>
+
+      <!-- 事件列表 -->
+      <div class="sv-section sv-events-section" :class="{ collapsed: !showEventStream }">
+        <div class="sv-section-title">
+          事件流（最近 {{ recentEvents.length }} 条）
+          <span class="sv-section-actions">
+            <button v-if="recentEvents.length > 0" class="btn-clear" @click="clearAll">清除</button>
+            <button class="btn-clear" @click="showEventStream = !showEventStream">
+              {{ showEventStream ? '折叠' : '展开' }}
+            </button>
+          </span>
+        </div>
+        <div v-if="showEventStream" class="sv-events">
+          <div v-for="(e, i) in recentEvents" :key="i" class="sv-evt" :class="e.kind">
+            <span class="sv-evt-t">{{ fmtTime(e.t) }}</span>
+            <span class="sv-evt-kind" :class="evtColor(e.kind)">{{ e.kind }}</span>
+            <span class="sv-evt-detail">{{ evtDetail(e) }}</span>
+          </div>
+        </div>
+      </div>
+    </template>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, shallowRef, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
+import { useDashboard } from '../../composables/useDashboard'
+import { useEventSource } from '../../composables/useEventSource'
+import { useResourceStatus } from '../../composables/useResourceStatus'
+import { SvTimeline } from '../../lib/svTimeline'
+import { appendManyToLast } from '../../lib/boundedBuffer'
+import { takeNewStreamPoints } from '../../lib/streamCursor'
+import { computeTaskRows } from '../../lib/systemViewMetrics'
+import { appendAndTrimEventsByTime, appendAndTrimRanges, filterRangesByWindow } from '../../lib/systemViewTimeBuffer'
+import { formatScheduleCount } from '../../lib/systemViewLabels'
+import { importSystemViewJsonl } from '../../lib/systemViewImport'
+import ControlToolbar from './ControlToolbar.vue'
+
+const props = defineProps<{ deviceConnected: boolean }>()
+
+const dash = useDashboard('systemview')
+const { data, connect, disconnect } = useEventSource('/api/dash/systemview/stream', {
+  passthroughEvents: ['status', 'batch'],
+})
+const { checkConflict } = useResourceStatus()
+
+// ---- 状态 ----
+interface TaskStat { id: number; name: string; color: string; runUs: number; switches: number; prio?: number }
+interface TaskInterval { taskId: number; start: number; end: number; startTk?: number; endTk?: number }
+interface PendingStart { time: number; tick?: number }
+interface SystemViewLogItem { path: string; summary_path?: string }
+
+const PALETTE = ['#5b8cff', '#21c7a8', '#f5a623', '#e056fd', '#ff7675', '#fdcb6e',
+                 '#00cec9', '#a29bfe', '#55efc4', '#fab1a0', '#74b9ff', '#fd79a8']
+const fileInput = ref<HTMLInputElement | null>(null)
+const eventList = shallowRef<any[]>([])
+let analysisEvents: any[] = []
+const analysisBufferCount = ref(0)
+const taskStats = reactive<Record<number, TaskStat>>({})
+const pendingStart = reactive<Record<number, PendingStart>>({})
+const intervals = shallowRef<TaskInterval[]>([])
+const idleUs = ref(0)
+let firstT = 0
+let lastT = 0
+const meta = reactive({
+  synced: false,
+  dropped: 0,
+  cpuFreq: 0,
+  cpuFreqSource: '',
+  taskNames: {} as Record<number, string>,
+  recordingPath: '',
+  recordingSummaryPath: '',
+  recordingError: '',
+})
+let lastStreamSeq = 0
+const totalEventCount = ref(0)
+const windowUs = ref(2_000_000)
+const showEventStream = ref(false)
+const offlineMode = ref(false)
+const offlineFileName = ref('')
+const importStatus = ref('')
+const importError = ref(false)
+const latestLog = ref<SystemViewLogItem | null>(null)
+let importAbort: AbortController | null = null
+
+// ---- 交互式 canvas 时间轴 ----
+const tlCanvas = ref<HTMLCanvasElement | null>(null)
+const tlTip = ref<HTMLDivElement | null>(null)
+const tlLegend = ref<HTMLDivElement | null>(null)
+const tlVcpu = ref<HTMLDivElement | null>(null)
+let tlInstance: SvTimeline | null = null
+
+function tlGetIntervals() {
+  const visible = meta.cpuFreq
+    ? filterRangesByWindow(intervals.value, lastT, windowUs.value)
+    : intervals.value
+  return visible.map(it => ({
+    tid: it.taskId,
+    name: taskStats[it.taskId]?.name || meta.taskNames[it.taskId] || ('0x' + (it.taskId >>> 0).toString(16).toUpperCase()),
+    start: it.start, end: it.end, startTk: it.startTk, endTk: it.endTk,
+  }))
+}
+function tlReset() { tlInstance?.reset() }
+
+onMounted(() => {
+  refreshLogList()
+  if (tlCanvas.value && tlTip.value && tlLegend.value && tlVcpu.value) {
+    tlInstance = new SvTimeline(
+      { canvas: tlCanvas.value, tooltip: tlTip.value, legend: tlLegend.value, vcpu: tlVcpu.value },
+      {
+        intervals: tlGetIntervals(),
+        unit: meta.cpuFreq ? 'us' : 'tk',
+        tickHz: meta.cpuFreq || undefined,
+        follow: true,
+        windowSize: windowUs.value,
+      },
+    )
+  }
+})
+onUnmounted(() => {
+  abortImport()
+  tlInstance?.destroy()
+  tlInstance = null
+})
+
+// intervals 变化时喂给时间轴（rAF 节流：高频事件下 intervals 频繁 push，
+// 每次 setData+canvas redraw 会卡死浏览器；标记 dirty，每帧最多 redraw 一次）
+let tlDirty = false
+let tlRaf = 0
+function tlFlush() { tlRaf = 0; if (tlInstance && tlDirty) { tlDirty = false; tlInstance.setData(tlGetIntervals()) } }
+function scheduleTimelineFlush() {
+  tlDirty = true
+  if (!tlRaf) tlRaf = requestAnimationFrame(tlFlush)
+}
+watch(intervals, scheduleTimelineFlush)
+watch(windowUs, () => {
+  tlInstance?.setWindowSize(windowUs.value)
+  scheduleTimelineFlush()
+})
+// cpuFreq 变了切换单位（重建）
+watch(() => meta.cpuFreq, () => {
+  if (tlCanvas.value && tlTip.value && tlLegend.value && tlVcpu.value) {
+    tlInstance?.destroy()
+    tlInstance = new SvTimeline(
+      { canvas: tlCanvas.value, tooltip: tlTip.value, legend: tlLegend.value, vcpu: tlVcpu.value },
+      {
+        intervals: tlGetIntervals(),
+        unit: meta.cpuFreq ? 'us' : 'tk',
+        tickHz: meta.cpuFreq || undefined,
+        follow: true,
+        windowSize: windowUs.value,
+      },
+    )
+  }
+})
+
+const MAX_EVENTS = 800
+const ANALYSIS_EVENTS = 100_000
+const MAX_INTERVALS = 50_000
+const ANALYSIS_BUFFER_US = 60_000_000
+
+function taskNameFromMeta(id: number): string {
+  return meta.taskNames[id] || meta.taskNames[String(id) as any] || ''
+}
+
+function applyTaskNames(names: Record<number, string>) {
+  meta.taskNames = names
+  for (const [idText, name] of Object.entries(names)) {
+    const id = Number(idText)
+    if (Number.isFinite(id) && taskStats[id] && name) {
+      taskStats[id].name = name
+    }
+  }
+}
+
+function colorFor(id: number): string {
+  if (taskStats[id]) return taskStats[id].color
+  const idx = Object.keys(taskStats).length % PALETTE.length
+  return PALETTE[idx]
+}
+
+function ensureTask(id: number, name?: string): TaskStat {
+  if (!taskStats[id]) {
+    taskStats[id] = { id, name: name || taskNameFromMeta(id), color: colorFor(id), runUs: 0, switches: 0 }
+  }
+  const resolvedName = name || taskNameFromMeta(id)
+  if (resolvedName && !taskStats[id].name) taskStats[id].name = resolvedName
+  return taskStats[id]
+}
+
+function tOf(e: any): number {
+  // 优先用 µs（已按 CPUFreq 换算），否则 ticks
+  if (typeof e.t_us === 'number') return e.t_us
+  if (typeof e.t_ticks === 'number' && meta.cpuFreq > 0) {
+    return e.t_ticks * 1_000_000 / meta.cpuFreq
+  }
+  return e.t_ticks ?? 0
+}
+
+function tickOf(e: any): number | undefined {
+  return typeof e.t_ticks === 'number' ? e.t_ticks : undefined
+}
+
+function ingestEvents(events: any[], countEvents = true) {
+  const normalizedEvents = events.map(e => ({ ...e, t: tOf(e), tk: tickOf(e) }))
+  const newIntervals: TaskInterval[] = []
+
+  for (const e of normalizedEvents) {
+    const t = e.t
+    const tk = e.tk
+    if (t > 0) {
+      if (firstT === 0) firstT = t
+      if (t > lastT) lastT = t
+    }
+    const k = e.kind
+    if (k === 'task_start_exec' && typeof e.task_id === 'number') {
+      ensureTask(e.task_id, e.task_name)
+      pendingStart[e.task_id] = { time: t, tick: tk }
+      taskStats[e.task_id].switches++
+    } else if (k === 'task_stop_exec' && typeof e.task_id === 'number') {
+      const st = pendingStart[e.task_id]
+      if (st !== undefined && t >= st.time) {
+        newIntervals.push({ taskId: e.task_id, start: st.time, end: t, startTk: st.tick, endTk: tk })
+        taskStats[e.task_id].runUs += (t - st.time)
+        delete pendingStart[e.task_id]
+      }
+    } else if (k === 'task_info' && typeof e.task_id === 'number') {
+      ensureTask(e.task_id, e.name)
+      if (e.prio !== undefined) taskStats[e.task_id].prio = e.prio
+    } else if (k === 'idle') {
+      // idle 周期：用 delta 累计（粗略）
+      if (typeof e.cpu_delta_us === 'number') idleUs.value += e.cpu_delta_us
+    }
+  }
+
+  if (countEvents) totalEventCount.value += events.length
+  if (normalizedEvents.length) {
+    eventList.value = appendManyToLast(eventList.value, normalizedEvents, MAX_EVENTS)
+    analysisEvents = appendAndTrimEventsByTime(
+      analysisEvents,
+      normalizedEvents,
+      lastT,
+      ANALYSIS_BUFFER_US,
+      ANALYSIS_EVENTS,
+      event => event.t,
+    )
+    analysisBufferCount.value = analysisEvents.length
+  }
+  if (newIntervals.length) {
+    intervals.value = appendAndTrimRanges(
+      intervals.value,
+      newIntervals,
+      lastT,
+      ANALYSIS_BUFFER_US,
+      MAX_INTERVALS,
+    )
+  }
+}
+
+watch(data, (nw) => {
+  if (offlineMode.value) return
+  const fresh = takeNewStreamPoints(nw as any[], lastStreamSeq)
+  for (const dp of fresh.points as any[]) {
+    const evt = dp.event || dp._event
+    if (dp.synced !== undefined) meta.synced = !!dp.synced
+    if (dp.dropped_bytes !== undefined) meta.dropped = dp.dropped_bytes + (dp.dropped_packets || 0)
+    if (dp.cpu_freq !== undefined) meta.cpuFreq = dp.cpu_freq
+    if (dp.cpu_freq_source !== undefined) meta.cpuFreqSource = dp.cpu_freq_source || ''
+    if (dp.recording_path !== undefined) meta.recordingPath = dp.recording_path || meta.recordingPath
+    if (dp.recording_summary_path !== undefined) meta.recordingSummaryPath = dp.recording_summary_path || meta.recordingSummaryPath
+    if (dp.recording_error !== undefined) meta.recordingError = dp.recording_error || ''
+    const backendEvents = Number(dp.stats?.events)
+    if (Number.isFinite(backendEvents)) totalEventCount.value = Math.max(totalEventCount.value, backendEvents)
+    if (dp.task_names) applyTaskNames(dp.task_names)
+    if (evt === 'status' || evt === 'history') {
+      continue
+    }
+    if (evt === 'batch') { ingestEvents(dp.events || [], !Number.isFinite(backendEvents)); continue }
+    if (evt === 'data' || !evt) ingestEvents([dp])
+  }
+  lastStreamSeq = fresh.nextSeq
+})
+
+// ---- 计算属性 ----
+const eventCount = computed(() => totalEventCount.value)
+const taskCount = computed(() => Object.keys(taskStats).length)
+
+const tasksSorted = computed(() =>
+  computeTaskRows(Object.values(taskStats))
+)
+
+const recentEvents = computed(() => eventList.value.slice(-50).reverse())
+const currentJsonlPath = computed(() => meta.recordingPath || latestLog.value?.path || '')
+const currentSummaryPath = computed(() => meta.recordingSummaryPath || latestLog.value?.summary_path || '')
+
+// ---- 辅助 ----
+function clamp(v: number) { return Math.max(0, Math.min(100, v)) }
+function hexId(id: number) { return '0x' + (id >>> 0).toString(16).toUpperCase() }
+function fmtCpuFreq(freq: number) {
+  return freq >= 1_000_000 ? (freq / 1_000_000).toFixed(0) + 'MHz' : freq.toLocaleString() + 'Hz'
+}
+function fmtTime(t: any) {
+  if (typeof t === 'number' && meta.cpuFreq) return (t / 1_000_000).toFixed(6) + 's'
+  if (typeof t === 'number') return Math.round(t).toLocaleString() + ' tk'
+  return ''
+}
+function evtColor(k: string) {
+  if (k.startsWith('task_start')) return 'c-start'
+  if (k.startsWith('task_stop')) return 'c-stop'
+  if (k.startsWith('isr')) return 'c-isr'
+  if (k === 'idle') return 'c-idle'
+  return ''
+}
+function evtDetail(e: any) {
+  const parts: string[] = []
+  if (e.task_name) parts.push(e.task_name)
+  else if (e.task_id !== undefined) parts.push(hexId(e.task_id))
+  if (e.isr_name) parts.push(e.isr_name)
+  else if (e.isr_id !== undefined) parts.push('#' + e.isr_id)
+  if (e.cause !== undefined) parts.push('cause=' + e.cause)
+  if (e.cpu_delta_us !== undefined) parts.push(e.cpu_delta_us.toFixed(0) + 'us')
+  return parts.join(' ')
+}
+function clearAll() {
+  eventList.value = []
+  analysisEvents = []
+  analysisBufferCount.value = 0
+  intervals.value = []
+  Object.keys(taskStats).forEach(k => delete taskStats[Number(k)])
+  Object.keys(pendingStart).forEach(k => delete pendingStart[Number(k)])
+  totalEventCount.value = 0
+  idleUs.value = 0; firstT = 0; lastT = 0; lastStreamSeq = 0
+  meta.synced = false
+  meta.dropped = 0
+  meta.cpuFreq = 0
+  meta.cpuFreqSource = ''
+  meta.taskNames = {}
+  meta.recordingPath = ''
+  meta.recordingSummaryPath = ''
+  meta.recordingError = ''
+}
+
+async function refreshLogList() {
+  try {
+    const res = await fetch('/api/dash/systemview/logs')
+    if (!res.ok) return
+    const body = await res.json()
+    latestLog.value = Array.isArray(body.logs) ? body.logs[0] || null : null
+  } catch {
+    latestLog.value = null
+  }
+}
+
+function exportLog(path: string) {
+  if (!path) return
+  window.open(`/api/dash/systemview/logs/download?path=${encodeURIComponent(path)}`, '_blank')
+}
+
+function triggerImport() {
+  fileInput.value?.click()
+}
+
+async function onImportFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  await importLogFile(file)
+}
+
+async function importLogFile(file: File) {
+  abortImport()
+  const controller = new AbortController()
+  importAbort = controller
+  disconnect()
+  if (dash.state.value !== 'idle') {
+    await dash.stop()
+  }
+  clearAll()
+  offlineMode.value = true
+  offlineFileName.value = file.name
+  importStatus.value = '导入中'
+  importError.value = false
+  meta.synced = true
+
+  try {
+    const result = await importSystemViewJsonl({
+      stream: file.stream(),
+      batchSize: 1000,
+      signal: controller.signal,
+      onSession: record => applyImportedMeta(record),
+      onSummary: record => applyImportedMeta(record),
+      onBatch: events => {
+        ingestEvents(events, true)
+        importStatus.value = `导入中 ${totalEventCount.value.toLocaleString()}`
+      },
+    })
+    if (importAbort !== controller) return
+    const suffix = result.parseErrors || result.skipped
+      ? `，跳过 ${result.skipped.toLocaleString()}，错误 ${result.parseErrors.toLocaleString()}`
+      : ''
+    importStatus.value = `已导入 ${result.events.toLocaleString()}${suffix}`
+    importError.value = result.parseErrors > 0
+  } catch (e) {
+    if (importAbort !== controller) return
+    importError.value = !isAbortError(e)
+    importStatus.value = isAbortError(e)
+      ? '已取消'
+      : `导入失败：${e instanceof Error ? e.message : String(e)}`
+  } finally {
+    if (importAbort === controller) importAbort = null
+    scheduleTimelineFlush()
+  }
+}
+
+function applyImportedMeta(record: Record<string, unknown>) {
+  const cpuFreq = Number(record.cpu_freq)
+  if (Number.isFinite(cpuFreq) && cpuFreq > 0) meta.cpuFreq = cpuFreq
+  if (typeof record.cpu_freq_source === 'string') meta.cpuFreqSource = record.cpu_freq_source
+  const droppedBytes = Number(record.dropped_bytes)
+  const droppedPackets = Number(record.dropped_packets)
+  if (Number.isFinite(droppedBytes) || Number.isFinite(droppedPackets)) {
+    meta.dropped = Math.max(0, droppedBytes || 0) + Math.max(0, droppedPackets || 0)
+  }
+  if (record.task_names && typeof record.task_names === 'object' && !Array.isArray(record.task_names)) {
+    applyTaskNames(record.task_names as Record<number, string>)
+  }
+}
+
+function abortImport() {
+  if (importAbort) {
+    importAbort.abort()
+    importAbort = null
+  }
+}
+
+function returnToLive() {
+  abortImport()
+  offlineMode.value = false
+  offlineFileName.value = ''
+  importStatus.value = ''
+  importError.value = false
+  clearAll()
+  refreshLogList()
+}
+
+function isAbortError(value: unknown): boolean {
+  return value instanceof Error && /aborted/i.test(value.message)
+}
+
+async function onStart() {
+  abortImport()
+  offlineMode.value = false
+  offlineFileName.value = ''
+  importStatus.value = ''
+  importError.value = false
+  latestLog.value = null
+  const conflicts = await checkConflict('systemview')
+  if (conflicts.length > 0) {
+    const names = conflicts.map(c => c).join('、')
+    if (!confirm(`启动 SystemView 将停止当前运行的 ${names} 会话。确认？`)) return
+  }
+  clearAll()
+  await dash.start()
+  setTimeout(() => connect(), 500)
+}
+async function onStop() {
+  disconnect()
+  await dash.stop()
+  await refreshLogList()
+}
+</script>
+
+<style scoped>
+.sv-tab { display: flex; flex-direction: column; height: 100%; gap: 8px; }
+.alert-warn { color: var(--warn); padding: 8px; border: 1px solid var(--warn); border-radius: 4px; }
+.sv-toolbar { display: flex; align-items: center; gap: 12px; padding: 6px 0; flex-wrap: wrap; }
+.sv-offline-toolbar { padding-bottom: 0; }
+.sv-file-input { display: none; }
+.sv-stat { font-size: 12px; color: var(--muted); }
+.sv-stat b { color: var(--fg); }
+.sv-stat.warn { color: var(--warn); }
+.sv-window { font-size: 12px; color: var(--muted); margin-left: auto; display: flex; align-items: center; gap: 4px; }
+.sv-window select { background: #fbfaf5; color: var(--fg); border: 1px solid #d8d2c3; border-radius: 4px; padding: 2px 4px; }
+.sv-section { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; }
+.sv-section-title { font-size: 12px; color: var(--muted); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+.btn-clear { margin-left: auto; background: none; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-size: 11px; padding: 1px 8px; cursor: pointer; }
+.btn-clear:disabled { opacity: .45; cursor: not-allowed; }
+.sv-tool-btn,
+.sv-mode-btn { margin-left: 0; }
+.sv-section-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.sv-section-actions .btn-clear { margin-left: 0; }
+.sv-empty { color: var(--dim); font-size: 12px; padding: 12px; text-align: center; }
+
+/* CPU 条 */
+.sv-cpu-list { display: flex; flex-direction: column; gap: 3px; max-height: 130px; overflow-y: auto; }
+.sv-cpu-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.sv-cpu-name { width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.sv-cpu-bar-bg { flex: 1; height: 14px; background: #e7e2d6; border-radius: 0; overflow: hidden; }
+.sv-cpu-bar { height: 100%; border-radius: 0; transition: width 0.3s; }
+.sv-cpu-pct { width: 52px; text-align: right; color: var(--fg); font-variant-numeric: tabular-nums; }
+.sv-cpu-switches { width: 82px; text-align: right; color: var(--dim); font-size: 11px; }
+
+/* 甘特 */
+.sv-gantt-section { flex: 1 1 430px; min-height: 430px; display: flex; flex-direction: column; }
+.sv-legend { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
+.sv-legend :deep(.sv-lg) { display: inline-flex; align-items: center; gap: 4px; background: #fbfaf5; color: #374151; border: 1px solid #ddd8ca; border-radius: 12px; padding: 2px 9px; font-size: 11px; cursor: pointer; user-select: none; box-shadow: inset 0 -1px 0 rgba(0,0,0,.03); }
+.sv-legend :deep(.sv-lg i) { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.sv-legend :deep(.sv-lg em) { color: #6b7280; font-style: normal; }
+.sv-legend :deep(.sv-lg-off) { opacity: .4; text-decoration: line-through; }
+.sv-canvas-wrap { position: relative; background: #fbfaf5; border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; max-height: 360px; }
+.sv-canvas-wrap :deep(canvas) { display: block; width: 100%; cursor: crosshair; }
+.sv-tip { position: fixed; display: none; background: #1c2128; border: 1px solid #444c56; border-radius: 6px; padding: 6px 10px; font-size: 11px; color: #f0f6fc; pointer-events: none; z-index: 99; font-family: var(--font-mono, monospace); white-space: nowrap; }
+.sv-vcpu-title { font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+.sv-vcpu { display: flex; flex-direction: column; gap: 1px; }
+.sv-vcpu :deep(.sv-vcpu-row) { display: flex; align-items: center; gap: 8px; font-size: 11px; margin: 1px 0; }
+.sv-vcpu :deep(.sv-vcpu-n) { width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+.sv-vcpu :deep(.sv-vcpu-bg) { flex: 1; height: 11px; background: #e7e2d6; border-radius: 6px; overflow: hidden; }
+.sv-vcpu :deep(.sv-vcpu-bar) { height: 100%; border-radius: 6px; }
+
+/* 事件列表 */
+.sv-events-section { max-height: 200px; display: flex; flex-direction: column; }
+.sv-events-section.collapsed { flex: 0 0 auto; max-height: none; }
+.sv-events-section.collapsed .sv-section-title { margin-bottom: 0; }
+.sv-events { flex: 1; overflow-y: auto; background: #fbfaf5; border: 1px solid #e7e2d6; border-radius: 4px; padding: 6px; font-family: var(--font-mono); font-size: 11px; line-height: 1.5; }
+.sv-evt { display: flex; gap: 8px; white-space: nowrap; }
+.sv-evt-t { color: var(--dim); width: 110px; }
+.sv-evt-kind { width: 130px; }
+.sv-evt-detail { color: #374151; }
+.c-start { color: #5b8cff; }
+.c-stop { color: #ff7675; }
+.c-isr { color: #f5a623; }
+.c-idle { color: #555; }
+</style>

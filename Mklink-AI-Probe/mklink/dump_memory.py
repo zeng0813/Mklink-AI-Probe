@@ -70,11 +70,16 @@ EXPECTED_BLOCK_SIZE = 2048  # firmware-fixed per spec
 
 # Maximum total bytes per dump_memory() call.
 #
-# 32 KiB was confirmed safe on firmware 2026-06-06 v3:
-#   - OLD path (≤2048B): 100% reliable, CRC32 valid, full data returned
-#   - B1 path (2049..32768B): all bi received, block_crc32 + frame_crc32 valid
-# 64 KiB truncates the last block by 512B (BUG-5, see §10 of the test report).
-MAX_TOTAL_DATA_SIZE = 32 * 1024  # 32768
+# Default raised to 512 KiB on 2026-06-26: firmware V4.3.3 was retested end-to-end
+# on GD32F303CE (512 KiB Flash) and dumps the *entire* 512 KiB Flash cleanly —
+# 256 B1 blocks, all flags=0x0000, every block_crc32 + frame_crc32 valid. Full
+# retest data in docs/Mklink/2026-06-26-gd32f303-dump-flush-boundary-retest-report.md.
+#
+# CAUTION for older firmware: pre-V4.3.3 builds may still carry BUG-5 (>64 KiB
+# truncates the last block by 512B). On such firmware, pass smaller ADDR:SIZE
+# regions (≤32 KiB) from the host instead of relying on the raised default.
+# Use set_max_total_data_size() to lower the cap programmatically if needed.
+MAX_TOTAL_DATA_SIZE = 512 * 1024  # 524288
 
 
 # FLAGS bit masks
@@ -304,15 +309,16 @@ def set_max_total_data_size(size: int) -> None:
     """Override the max total data size for dump_memory batches.
 
     Args:
-        size: New max in bytes. Must not exceed 32 KiB unless the connected
-              firmware has been validated to support the larger value
-              (see docs/Mklink/dump_memory_b1_chunking_test_report.md §10 BUG-5).
+        size: New max in bytes. Default is 512 KiB (firmware V4.3.3 validated).
+              Must not exceed 512 KiB — that is the largest total validated to
+              date (see docs/Mklink/2026-06-26-gd32f303-dump-flush-boundary-retest-report.md).
+              Use this to *lower* the cap (e.g. on older firmware carrying BUG-5).
     """
     global MAX_TOTAL_DATA_SIZE
-    if size > 32 * 1024:
+    if size > 512 * 1024:
         raise ValueError(
-            f"size {size} exceeds the 32 KiB safe limit. "
-            f"See dump_memory_b1_chunking_test_report.md §10 BUG-5."
+            f"size {size} exceeds the 512 KiB validated ceiling. "
+            f"See docs/Mklink/2026-06-26-gd32f303-dump-flush-boundary-retest-report.md."
         )
     MAX_TOTAL_DATA_SIZE = size
 
@@ -331,15 +337,15 @@ def build_dump_mem_command(
         Command string like "cmd.dump_memory(0x20000054, 4, 0x2000006C, 2, 0.01)"
 
     Raises:
-        ValueError: if total region size exceeds MAX_TOTAL_DATA_SIZE (32 KiB).
-                    Use the `mklink dump` CLI's --chunk option to split large
-                    requests at the host level.
+        ValueError: if total region size exceeds MAX_TOTAL_DATA_SIZE (default 512 KiB).
+                    Pass smaller ADDR:SIZE regions to split large requests at the host level
+                    (e.g. on older firmware that truncates >64 KiB dumps — BUG-5).
     """
     total_size = sum(size for _, size in region_pairs)
     if total_size > MAX_TOTAL_DATA_SIZE:
         raise ValueError(
             f"Total region size {total_size} exceeds maximum {MAX_TOTAL_DATA_SIZE} bytes "
-            f"(32 KiB). Split the request into <=32 KiB chunks at the host level."
+            f"(512 KiB). Split the request into smaller ADDR:SIZE regions at the host level."
         )
     parts = []
     for addr, size in region_pairs:

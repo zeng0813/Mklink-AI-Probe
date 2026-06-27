@@ -99,7 +99,24 @@ export interface JsonRpcResponse {
   id: number | string | null
 }
 
-export type DashboardType = 'rtt' | 'serial' | 'modbus' | 'superwatch' | 'vofa'
+export type DashboardType = 'rtt' | 'serial' | 'modbus' | 'superwatch' | 'vofa' | 'systemview'
+
+// SystemView（RTOS 跟踪）解码事件——由后端 SystemViewParser 产出
+export interface SystemViewEvent {
+  _t?: number
+  event?: string
+  kind: string
+  task_id?: number
+  task_name?: string
+  isr_id?: number
+  isr_name?: string
+  cause?: number
+  prio?: number
+  t_ticks?: number
+  t_us?: number
+  delta_ticks?: number
+  cpu_delta_us?: number
+}
 
 export interface DashboardInfo {
   running: boolean

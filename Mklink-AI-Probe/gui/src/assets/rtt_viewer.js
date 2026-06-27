@@ -146,6 +146,7 @@ var colorIdx = 0;
 var paused = false;
 var tStart = 0;
 var rawLogLineCount = 0;
+var vofaChannels = [];
 var WATCH_COLUMNS = [
   { key: 'name', label: 'Name', width: 124, minWidth: 72, visible: true },
   { key: 'type', label: 'Type', width: 72, minWidth: 48, visible: true },
@@ -335,6 +336,10 @@ function sseOnMessage(e) {
       updateCollectionUI(data.state);
       return;
     }
+    if (data._event === 'status') {
+      syncDashboardStatus(data);
+      return;
+    }
     if (data._event === 'interval_change') {
       currentInterval = data.interval;
       document.getElementById('interval-input').value = data.interval;
@@ -419,6 +424,57 @@ function updateSampleRateBadge(interval, rate) {
   }
 }
 
+function normalizeVofaChannels(channels) {
+  if (!Array.isArray(channels)) return [];
+  var out = [];
+  for (var i = 0; i < channels.length; i++) {
+    var ch = channels[i] || {};
+    var addr = ch.addr !== undefined ? ch.addr : ch.address;
+    if (addr === undefined || addr === null || addr === '') continue;
+    out.push({
+      name: ch.name || String(addr),
+      addr: addr,
+      type: ch.type || 'float',
+      size: ch.size || 4
+    });
+  }
+  return out;
+}
+
+function apiErrorMessage(payload, status) {
+  if (payload && payload.detail) {
+    if (typeof payload.detail === 'string') return payload.detail;
+    try { return JSON.stringify(payload.detail); } catch (_) {}
+  }
+  if (payload && payload.error) return String(payload.error);
+  return 'Request failed' + (status ? ' (' + status + ')' : '');
+}
+
+function showControlError(message) {
+  var connStatus = document.getElementById('conn-status');
+  if (!connStatus) return;
+  connStatus.textContent = message || t('error');
+  connStatus.className = 'badge badge-err';
+}
+
+function syncDashboardStatus(d) {
+  if (!d) return;
+  if (IS_VOFA_MODE && Array.isArray(d.channels)) {
+    vofaChannels = normalizeVofaChannels(d.channels);
+  }
+  var nextState = d.state;
+  if (!nextState && d.running !== undefined) {
+    nextState = d.running ? (d.paused ? 'paused' : 'running') : 'stopped';
+  }
+  updateCollectionUI(nextState || 'stopped');
+  updateSampleRateBadge(d.estimated_interval, d.estimated_rate);
+  applyChannelMetadata(d.channel_metadata || {});
+  if (d.interval !== undefined && d.interval > 0) {
+    currentInterval = d.interval;
+    document.getElementById('interval-input').value = d.interval;
+  }
+}
+
 function updateCollectionUI(state) {
   collectionState = state;
   var btnStart = document.getElementById('btn-start');
@@ -465,9 +521,25 @@ if (typeof window !== 'undefined') {
 
 document.getElementById('btn-start').addEventListener('click', function() {
   if (typeof CONFIG !== 'undefined' && CONFIG.deviceConnected === false) return;
-  fetch(API_CTRL + 'start', {method:'POST'})
-    .then(function(r){return r.json()})
+  var opts = {method:'POST'};
+  if (IS_VOFA_MODE && vofaChannels.length > 0) {
+    opts.headers = {'Content-Type': 'application/json'};
+    opts.body = JSON.stringify({
+      channels: vofaChannels,
+      interval: currentInterval > 0 ? currentInterval : 0.1
+    });
+  }
+  fetch(API_CTRL + 'start', opts)
+    .then(function(r){
+      return r.json().catch(function(){ return {}; }).then(function(d){
+        if (!r.ok) throw new Error(apiErrorMessage(d, r.status));
+        return d;
+      });
+    })
     .then(function(d){
+      if (IS_VOFA_MODE && Array.isArray(d.channels)) {
+        vofaChannels = normalizeVofaChannels(d.channels);
+      }
       updateCollectionUI('running');
       // Reconnect SSE if needed
       if (!es || es.readyState === EventSource.CLOSED) {
@@ -478,7 +550,10 @@ document.getElementById('btn-start').addEventListener('click', function() {
         es.onopen = sseOnOpen;
       }
     })
-    .catch(function(){});
+    .catch(function(err){
+      updateCollectionUI('stopped');
+      showControlError(err && err.message ? err.message : t('error'));
+    });
 });
 document.getElementById('btn-pause').addEventListener('click', function() {
   var action = (collectionState === 'paused') ? 'resume' : 'pause';
@@ -522,13 +597,7 @@ document.getElementById('btn-apply-interval').addEventListener('click', function
 fetch(API_CTRL + 'status')
   .then(function(r){return r.json()})
   .then(function(d){
-    updateCollectionUI(d.state);
-    updateSampleRateBadge(d.estimated_interval, d.estimated_rate);
-    applyChannelMetadata(d.channel_metadata || {});
-    if (d.interval !== undefined && d.interval > 0) {
-      currentInterval = d.interval;
-      document.getElementById('interval-input').value = d.interval;
-    }
+    syncDashboardStatus(d);
   })
   .catch(function(){});
 

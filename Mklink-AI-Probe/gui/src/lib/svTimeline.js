@@ -43,6 +43,8 @@ export class SvTimeline {
     this.viewStart = null;
     this.viewEnd = null;
     this._hadIntervals = false;
+    this._taskOrder = [];
+    this._taskMeta = new Map();
     this.follow = (data && data.follow) !== false;
     this.windowSize = Number((data && data.windowSize) || 0);
     this.followEase = 0.22;
@@ -66,10 +68,7 @@ export class SvTimeline {
       run.set(it.tid, (run.get(it.tid) || 0) + (it.end - it.start));
       names.set(it.tid, it.name);
     }
-    this.tasks = [...run.entries()]
-      .sort((a, b) => b[1] - a[1]).slice(0, 12)
-      .map(([tid], i) => ({ tid, name: names.get(tid) || ('0x' + (tid >>> 0).toString(16).toUpperCase()),
-        color: this.PALETTE[i % this.PALETTE.length] }));
+    this.tasks = this._mergeTasks(run, names);
     this.taskOf = new Map(this.tasks.map(t => [t.tid, t]));
     // 时间范围
     if (this.intervals.length) {
@@ -104,6 +103,41 @@ export class SvTimeline {
     this._draw();
     this._updateStatus();
     if (shouldFollow && !viewInvalid && hadIntervalsBefore) this._scheduleFollow();
+  }
+
+  _mergeTasks(run, names) {
+    if (!this._taskOrder) this._taskOrder = [];
+    if (!this._taskMeta) this._taskMeta = new Map();
+
+    const ranked = [...run.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([tid]) => tid);
+    const active = new Set(ranked);
+
+    for (const tid of ranked) {
+      const name = names.get(tid) || ('0x' + (tid >>> 0).toString(16).toUpperCase());
+      if (!this._taskMeta.has(tid)) {
+        this._taskMeta.set(tid, {
+          tid,
+          name,
+          color: this.PALETTE[this._taskMeta.size % this.PALETTE.length],
+        });
+      } else if (name) {
+        this._taskMeta.get(tid).name = name;
+      }
+      if (!this._taskOrder.includes(tid)) this._taskOrder.push(tid);
+    }
+
+    this._taskOrder = this._taskOrder.filter(tid => active.has(tid));
+    for (const tid of ranked) {
+      if (!this._taskOrder.includes(tid)) this._taskOrder.push(tid);
+    }
+
+    return this._taskOrder
+      .map(tid => this._taskMeta.get(tid))
+      .filter(Boolean)
+      .slice(0, 12);
   }
 
   setWindowSize(windowSize) {
@@ -177,15 +211,30 @@ export class SvTimeline {
   _filterContinuous(intervals) {
     if (intervals.length < 8) return intervals;
     let maxGap = 0, maxIdx = 0;
+    let tMin = Infinity, tMax = -Infinity;
     for (let i = 0; i < intervals.length - 1; i++) {
       const g = intervals[i + 1].start - intervals[i].end;
       if (g > maxGap) { maxGap = g; maxIdx = i; }
+      if (intervals[i].start < tMin) tMin = intervals[i].start;
+      if (intervals[i].end > tMax) tMax = intervals[i].end;
     }
+    const last = intervals[intervals.length - 1];
+    if (last.start < tMin) tMin = last.start;
+    if (last.end > tMax) tMax = last.end;
     const durs = intervals.map(it => it.end - it.start).sort((a, b) => a - b);
     const med = durs[Math.floor(durs.length / 2)] || 1;
+    if (maxGap <= this._largeGapThreshold(Math.max(0, tMax - tMin), med)) return intervals;
     if (maxGap <= med * 200) return intervals; // 无离群缺口
     const left = intervals.slice(0, maxIdx + 1), right = intervals.slice(maxIdx + 1);
     return this._filterContinuous(left.length >= right.length ? left : right);
+  }
+
+  _largeGapThreshold(span, medianDuration) {
+    const oneSecond = this.unit === 'us'
+      ? 1_000_000
+      : (this.tickHz > 0 ? this.tickHz : 1_000_000);
+    const windowThreshold = this.windowSize > 0 ? this.windowSize * 2 : span * 0.2;
+    return Math.max(medianDuration * 200, oneSecond * 2, windowThreshold);
   }
 
   _t2x(t) { return this.plotX0 + (t - this.viewStart) / (this.viewEnd - this.viewStart) * this.plotW; }
@@ -357,7 +406,10 @@ export class SvTimeline {
   }
 
   _bind() {
-    this.canvas.addEventListener('wheel', (e) => {
+    if (this._listenersBound) return;
+
+    this._onWheel = (e) => {
+      if (!this._shouldZoomWheel(e)) return;
       e.preventDefault();
       this.setFollowMode(false);
       const rect = this.canvas.getBoundingClientRect();
@@ -371,14 +423,15 @@ export class SvTimeline {
       this.viewStart = Math.max(this.tMin, ns);
       this.viewEnd = Math.min(this.tMax, ne);
       this._draw(); this._updateStatus();
-    }, { passive: false });
+    };
 
-    this.canvas.addEventListener('mousedown', (e) => {
+    this._onMouseDown = (e) => {
       this.setFollowMode(false);
       this.dragging = true; this.dragX0 = e.clientX; this.dragView0 = [this.viewStart, this.viewEnd];
       this.canvas.style.cursor = 'grabbing';
-    });
-    window.addEventListener('mousemove', (e) => {
+    };
+
+    this._onMouseMove = (e) => {
       const rect = this.canvas.getBoundingClientRect();
       const mx = e.clientX - rect.left, my = e.clientY - rect.top;
       if (this.dragging) {
@@ -396,10 +449,22 @@ export class SvTimeline {
         if (hit) this._showTip(e.clientX, e.clientY, hit); else this._hideTip();
         this._draw();
       }
-    });
-    window.addEventListener('mouseup', () => { this.dragging = false; this.canvas.style.cursor = 'crosshair'; });
-    this.canvas.addEventListener('mouseleave', () => { this.hover = null; this._hideTip(); this._draw(); });
+    };
+
+    this._onMouseUp = () => { this.dragging = false; this.canvas.style.cursor = 'crosshair'; };
+    this._onMouseLeave = () => { this.hover = null; this._hideTip(); this._draw(); };
+
+    this.canvas.addEventListener('wheel', this._onWheel, { passive: false });
+    this.canvas.addEventListener('mousedown', this._onMouseDown);
+    window.addEventListener('mousemove', this._onMouseMove);
+    window.addEventListener('mouseup', this._onMouseUp);
+    this.canvas.addEventListener('mouseleave', this._onMouseLeave);
     if (this.roots.resetBtn) this.roots.resetBtn.onclick = () => this.reset();
+    this._listenersBound = true;
+  }
+
+  _shouldZoomWheel(e) {
+    return !!(e.ctrlKey || e.shiftKey);
   }
 
   _escapeHtml(value) {
@@ -432,7 +497,7 @@ export class SvTimeline {
     }
     const total = [...run.values()].reduce((a, b) => a + b, 0) || 1;
     const items = this.tasks.map(t => ({ ...t, pct: ((run.get(t.tid) || 0) / total * 100) }))
-      .filter(t => t.pct > 0.001).sort((a, b) => b.pct - a.pct);
+      .filter(t => t.pct > 0.001);
     // 图例
     if (this.roots.legend) {
       this.roots.legend.innerHTML = items.map(t =>
@@ -472,6 +537,16 @@ export class SvTimeline {
       this._followRaf = 0;
     }
     window.removeEventListener('resize', this._resize);
+    if (this._listenersBound) {
+      this.canvas.removeEventListener('wheel', this._onWheel);
+      this.canvas.removeEventListener('mousedown', this._onMouseDown);
+      window.removeEventListener('mousemove', this._onMouseMove);
+      window.removeEventListener('mouseup', this._onMouseUp);
+      this.canvas.removeEventListener('mouseleave', this._onMouseLeave);
+      if (this.roots.resetBtn) this.roots.resetBtn.onclick = null;
+      this._listenersBound = false;
+    }
+    this._hideTip();
     // （其它监听挂在 window/canvas，组件卸载时随 DOM 释放；简单场景可接受）
   }
 }

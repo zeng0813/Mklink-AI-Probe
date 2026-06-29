@@ -43,14 +43,7 @@
     <td align="center"><b>Dashboard — RTT 实时波形可视化</b></td>
   </tr>
   <tr>
-    <td><img src="Mklink-AI-Probe/docs/gui-config.png" width="480" /></td>
-    <td><img src="Mklink-AI-Probe/docs/gui-dashboard.png" width="480" /></td>
-  </tr>
-  <tr>
     <td align="center" colspan="2"><b>SuperWatch — 高频变量实时监控</b></td>
-  </tr>
-  <tr>
-    <td align="center" colspan="2"><img src="Mklink-AI-Probe/docs/gui-superwatch.png" width="480" /></td>
   </tr>
 </table>
 
@@ -302,7 +295,6 @@ Mklink-AI-Probe/              # 本仓库根目录
     │   └── serial/           # 串口通信
     ├── gui/                  # Vue 3 + Tauri GUI
     │   └── src/components/dash/SystemViewTab.vue
-    ├── docs/                 # 调试记录、测试计划、SystemView 设计
     ├── references/           # 命令与安装文档（AI 按需读取）
     ├── MK-Firmware/          # MicroLink 烧录器固件 (.uf2)
     ├── skills/               # 子技能 / 辅助构建 skill

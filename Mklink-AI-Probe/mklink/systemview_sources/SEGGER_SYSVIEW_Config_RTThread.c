@@ -77,7 +77,7 @@ extern unsigned int SystemCoreClock;
 #ifndef   SYSVIEW_DEVICE_NAME
 	#ifndef PKG_USING_SYSTEMVIEW
 		#define SYSVIEW_DEVICE_NAME     "Cortex-M4"
-	#else
+  	#else
 		#define SYSVIEW_DEVICE_NAME        PKG_SYSVIEW_DEVICE_NAME
 	#endif
 #endif
@@ -86,7 +86,7 @@ extern unsigned int SystemCoreClock;
 #ifndef   SYSVIEW_TIMESTAMP_FREQ
 	#ifndef PKG_USING_SYSTEMVIEW
 		#define SYSVIEW_TIMESTAMP_FREQ  (SystemCoreClock)
-	#else
+  	#else
 		#if PKG_SYSVIEW_TIMESTAMP_FREQ == 0
 			#define SYSVIEW_TIMESTAMP_FREQ        (SystemCoreClock)
 		#else
@@ -99,7 +99,7 @@ extern unsigned int SystemCoreClock;
 #ifndef   SYSVIEW_CPU_FREQ
 	#ifndef PKG_USING_SYSTEMVIEW
 		#define SYSVIEW_CPU_FREQ        (SystemCoreClock)
-	#else
+  	#else
 		#if PKG_SYSVIEW_CPU_FREQ == 0
 			#define SYSVIEW_CPU_FREQ        (SystemCoreClock)
 		#else
@@ -121,7 +121,7 @@ extern unsigned int SystemCoreClock;
 #ifndef   USE_CYCCNT_TIMESTAMP
 	#ifndef PKG_USING_SYSTEMVIEW
 		#define USE_CYCCNT_TIMESTAMP    1
-	#else
+  	#else
 		#ifdef PKG_SYSVIEW_USE_CYCCNT_TIMESTAMP
 			#define USE_CYCCNT_TIMESTAMP    1
 		#endif
@@ -211,7 +211,7 @@ void SEGGER_SYSVIEW_Conf(void) {
   //  The cycle counter must be activated in order
   //  to use time related functions.
   //
-  ENABLE_DWT_CYCLE_COUNTER();
+  ENABLE_DWT_CYCLE_COUNTER();  
 #endif
   SEGGER_SYSVIEW_Init(SYSVIEW_TIMESTAMP_FREQ, SYSVIEW_CPU_FREQ,
                       &SYSVIEW_X_OS_TraceAPI, _cbSendSystemDesc);

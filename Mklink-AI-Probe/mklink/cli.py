@@ -275,8 +275,70 @@ def _cli_project_init(project_root: str):
 
     project_info["ide_type"] = ide_type
 
+    # --- MCU profile 匹配/发现。必须先于 FLM 处理，避免未知 MCU 落到 custom。 ---
+    profiles = load_mcu_profiles()
+    device_name = project_info.get("device", "")
+    mcu_key = match_mcu_by_device(device_name, profiles)
+    mcu_detect_result = None
+    com_port = None
+    is_hpm_project = (
+        str(project_info.get("vendor", "")).lower() == "hpmicro"
+        or str(project_info.get("board", "")).lower().startswith("hpm")
+        or str(ide_type).lower().startswith("hpm")
+        or str(ide_type) == "SEGGER Embedded Studio"
+    )
+    if not mcu_key and not is_hpm_project:
+        from mklink.mcu_detect import detect_mcu_profile
+        from mklink.discovery import find_mklink_cdc_port
+
+        try:
+            com_port = find_mklink_cdc_port()
+        except Exception:
+            com_port = None
+
+        mcu_detect_result = detect_mcu_profile(
+            project_root=project_root,
+            device=device_name,
+            project_info=project_info,
+            port=com_port,
+            write_profile=True,
+            copy_flm=True,
+            read_idcode=bool(com_port),
+        )
+        status = mcu_detect_result.get("status")
+        if status in ("created", "matched"):
+            mcu_key = mcu_detect_result.get("profile_key")
+            profile = mcu_detect_result.get("profile") or {}
+            if mcu_key and profile:
+                profiles[mcu_key] = profile
+            project_info["mcu_detect"] = {
+                "status": status,
+                "profile_key": mcu_key,
+                "selected_algorithm": mcu_detect_result.get("selected_algorithm"),
+                "microkeen_flm": mcu_detect_result.get("microkeen_flm"),
+                "flm_copied": mcu_detect_result.get("flm_copied", False),
+            }
+            print(f"[AUTO] 已发现 MCU profile: {mcu_key}")
+        elif status == "needs_selection":
+            print("[FAIL] 发现多个内部 Flash 算法，请指定 FLM 后重试:")
+            for i, candidate in enumerate(mcu_detect_result.get("candidates", []), 1):
+                print(f"  {i}. {candidate.get('name')} (size={candidate.get('size')})")
+            print("提示: python -m mklink mcu-detect --flm <CMSIS/Flash/xxx.FLM>")
+            return
+        else:
+            print(f"[FAIL] MCU profile 发现失败: {mcu_detect_result.get('message', status)}")
+            return
+
+    mcu_profile = profiles.get(mcu_key, {}) if mcu_key else {}
+    mcu_name = mcu_profile.get("name", mcu_key) if mcu_key else "custom"
+
     # --- FLM 处理（Keil 和 IAR 都通过 mcu_profiles 获取 FLM） ---
     flm_name = project_info.get("flm_name", "")
+    profile_flm = (mcu_profile.get("flm_path") or "").replace("\\", "/")
+    if not flm_name and profile_flm:
+        flm_name = profile_flm.split("/")[-1]
+        project_info["flm_name"] = flm_name
+        project_info["flm_path_on_device"] = f"FLM/{flm_name}"
     flm_on_keil = None
     flm_on_microkeen = None
     flm_copied = False
@@ -339,13 +401,6 @@ def _cli_project_init(project_root: str):
     project_save = {k: v for k, v in project_info.items() if k != "groups"}
     save_project_info(project_root, project_save)
 
-    # --- 打印完整初始化结果 ---
-    # 匹配 MCU 配置
-    profiles = load_mcu_profiles()
-    device_name = project_info.get("device", "")
-    mcu_key = match_mcu_by_device(device_name, profiles)
-    mcu_name = profiles[mcu_key]["name"] if mcu_key and mcu_key != "custom" else "custom"
-
     print()
     print("=" * 50)
     print("  项目初始化结果")
@@ -406,8 +461,9 @@ def _cli_project_init(project_root: str):
     print("=" * 50)
 
     # 自动检测 COM 口
-    from mklink.discovery import find_mklink_cdc_port
-    com_port = find_mklink_cdc_port()
+    if com_port is None:
+        from mklink.discovery import find_mklink_cdc_port
+        com_port = find_mklink_cdc_port()
     if com_port:
         print(f"  COM 口:   {com_port} (自动检测)")
     else:
@@ -741,25 +797,26 @@ def _cli_systemview(
 
 def _cli_copy_flm(project_root: str):
     """拷贝 FLM 文件到 MICROKEEN 磁盘。"""
-    from mklink.project_config import load_project_info
+    from mklink.project_config import load_config, load_project_info
     from mklink.discovery import check_flm_on_microkeen, copy_flm_to_microkeen
+    from mklink.profiles import load_mcu_profiles
 
     project = load_project_info(project_root)
     if project is None:
         print("[FAIL] 项目未配置，先运行 `python -m mklink project-init`")
         return
 
-    ide_type = project.get("ide_type", "Keil")
-    if ide_type == "IAR":
-        print("[FAIL] IAR 项目使用 .board flash loader，不需要拷贝 FLM")
-        flash_loader = project.get("flash_loader_path", "")
-        if flash_loader:
-            print(f"  Flash Loader: {flash_loader}")
-        return
-
     flm_name = project.get("flm_name", "")
     if not flm_name:
+        config = load_config(project_root) or {}
+        mcu_key = config.get("mcu_key", "")
+        profile = load_mcu_profiles().get(mcu_key, {})
+        flm_path = str(profile.get("flm_path", "")).replace("\\", "/")
+        if flm_path:
+            flm_name = flm_path.split("/")[-1]
+    if not flm_name:
         print("[FAIL] 未找到 FLM 配置")
+        print("提示: 先运行 `python -m mklink mcu-detect` 固化 MCU profile")
         return
 
     # 检查是否已存在
@@ -774,7 +831,9 @@ def _cli_copy_flm(project_root: str):
         print(f"[FAIL] FLM '{flm_name}' 拷贝失败")
         print("请确保：")
         print("  1. [MICROKEEN] 磁盘已插入")
-        print("  2. Keil 已安装且包含该芯片的 FLM")
+        print("  2. Keil/Arm Pack 已安装且包含该芯片的 FLM")
+    else:
+        print(f"[OK] 已拷贝 FLM: {dest}")
 
 
 def _cli_project_info(project_root: str):
@@ -3549,6 +3608,88 @@ def _cli_mcp(args):
     run_mcp_server()
 
 
+def _print_mcu_detect_result(result: dict, *, json_output: bool = False) -> None:
+    if json_output:
+        import json
+
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    status = result.get("status")
+    if status in ("created", "matched"):
+        prefix = "[OK]" if status == "matched" else "[AUTO]"
+        print(f"{prefix} MCU profile: {result.get('profile_key')} ({result.get('device')})")
+        selected = result.get("selected_algorithm") or {}
+        if selected:
+            print(f"  FLM: {selected.get('name')}")
+        if result.get("flm_source"):
+            print(f"  FLM source: {result.get('flm_source')}")
+        if result.get("microkeen_flm"):
+            copied = " (已拷贝)" if result.get("flm_copied") else ""
+            print(f"  MICROKEEN: {result.get('microkeen_flm')}{copied}")
+        if result.get("profile_written"):
+            print(f"  profile: {result.get('profile_path')}")
+            if result.get("backup_path"):
+                print(f"  backup:  {result.get('backup_path')}")
+        return
+
+    if status == "needs_selection":
+        print("[WARN] 发现多个内部 Flash 算法:")
+        for i, candidate in enumerate(result.get("candidates", []), 1):
+            print(f"  {i}. {candidate.get('name')} (size={candidate.get('size')})")
+        print("请用 --flm <CMSIS/Flash/xxx.FLM> 指定后重试。")
+        return
+
+    print(f"[FAIL] {result.get('message', status)}")
+
+
+def _cli_mcu_detect(
+    project_root: str,
+    device: str | None,
+    port: str | None,
+    flm: str | None,
+    json_output: bool,
+):
+    """发现/固化 MCU profile 和 FLM。"""
+    from mklink.mcu_detect import detect_mcu_profile
+
+    result = detect_mcu_profile(
+        project_root=project_root,
+        device=device,
+        port=port,
+        flm=flm,
+        write_profile=True,
+        copy_flm=True,
+        read_idcode=bool(port),
+    )
+
+    if result.get("status") == "needs_selection" and not json_output and sys.stdin.isatty():
+        candidates = result.get("candidates", [])
+        for i, candidate in enumerate(candidates, 1):
+            print(f"  {i}. {candidate.get('name')} (size={candidate.get('size')})")
+        try:
+            choice = input("选择 FLM 编号并固化（留空取消）: ").strip()
+        except EOFError:
+            choice = ""
+        if choice:
+            try:
+                selected = candidates[int(choice) - 1]["name"]
+            except (ValueError, IndexError, KeyError):
+                print("[FAIL] 无效选择")
+                return
+            result = detect_mcu_profile(
+                project_root=project_root,
+                device=device,
+                port=port,
+                flm=selected,
+                write_profile=True,
+                copy_flm=True,
+                read_idcode=bool(port),
+            )
+
+    _print_mcu_detect_result(result, json_output=json_output)
+
+
 def main():
     """CLI 入口，首先执行依赖检查。"""
     # Windows 控制台 UTF-8 支持
@@ -3607,6 +3748,14 @@ def main():
     # project-init 子命令
     init_parser = subparsers.add_parser("project-init", help="初始化项目配置（解析 Keil 工程 + 检测 RTT）")
     _add_project_root_arg(init_parser)
+
+    # mcu-detect 子命令
+    mcu_detect_parser = subparsers.add_parser("mcu-detect", help="发现/固化未知 MCU profile 与 FLM")
+    _add_project_root_arg(mcu_detect_parser)
+    mcu_detect_parser.add_argument("--device", default=None, help="MCU 型号，如 STM32H723ZETx")
+    mcu_detect_parser.add_argument("--port", default=None, help="可选：连接目标读取 IDCODE")
+    mcu_detect_parser.add_argument("--flm", default=None, help="指定要固化的 PDSC 算法路径")
+    mcu_detect_parser.add_argument("--json", action="store_true", help="输出 JSON")
 
     # project-info 子命令
     info_parser = subparsers.add_parser("project-info", help="显示项目已缓存的配置")
@@ -4185,6 +4334,14 @@ def main():
         _cli_iar_parse(_resolve_project_root(args))
     elif args.command == "project-init":
         _cli_project_init(_resolve_project_root(args))
+    elif args.command == "mcu-detect":
+        _cli_mcu_detect(
+            _resolve_project_root(args),
+            device=args.device,
+            port=args.port,
+            flm=args.flm,
+            json_output=args.json,
+        )
     elif args.command == "project-info":
         _cli_project_info(_resolve_project_root(args))
     elif args.command == "rtt-integrate":

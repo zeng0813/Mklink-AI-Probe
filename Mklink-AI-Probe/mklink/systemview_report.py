@@ -240,3 +240,4 @@ legend:document.getElementById('sv-legend'),vcpu:document.getElementById('sv-vcp
 resetBtn:document.getElementById('sv-reset')}},{{intervals:d.intervals,unit:d.unit}});}}catch(e){{console.error(e);}}}})();
 </script>
 </body></html>"""
+

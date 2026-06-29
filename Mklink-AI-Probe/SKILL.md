@@ -36,12 +36,14 @@ description: |
 - Modbus 点表：先 `detect` 汇报并确认，再 `generate`
 - 执行具体操作前：**先 Read 下方路由表对应的 reference**，理解边界（如 flush-memory 分块、RTT 静态模式选型）
 - **符号/AXF 功能依赖 `arm-none-eabi-readelf`**（GNU Arm 工具链，**不内置**）：`load_symbols`/`read_variable`/`write_variable`/`memory_map`/`decode_hardfault` 源码行需它。**首调 `ping` 看 `readelf_available`**；缺失时 `connect(axf=)` 仍成功但返回 `axf_loaded:false` + `axf_error`（提示安装），引导用户 `winget install Arm.GnuArmEmbeddedToolchain` 或设 `MKLINK_READELF`/`.mklink/toolchain.json`。flash/RTT/内存/寄存器/断点/Modbus/串口**不**需要它。
+- **未知 MCU 禁止直接改 `custom` 兜底**：烧录前若项目 MCU 不在 `mcu_profiles.json`，先调用 MCP `detect_mcu_profile` 或 CLI `python -m mklink mcu-detect`。多内部 FLM 候选时把候选报给用户选择，再用 `flm`/`--flm` 固化；找不到本地 FLM/Pack 时停止并提示安装或解包 Keil/Arm Pack。
 
-## MCP tool 速查（51 tools，按能力域）
+## MCP tool 速查（52 tools，按能力域）
 
 | 域 | Tools | 备注 |
 |---|---|---|
 | 健康 | `ping` | 无需连接，首调确认 server 活着 |
+| 项目配置 | `detect_mcu_profile` | 新 MCU 发现、FLM 候选选择、profile 固化 |
 | 连接 | `discover_probes` · `connect` · `disconnect` · `device_status` | connect 传 `axf=` 才能读变量 |
 | Flash | `flash` · `erase_chip` · `erase_sector` · `reset` | flash 一站式（MCU+FLM+时钟自动） |
 | 内存 | `read_memory` · `write_memory` · `flush_memory` | flush_memory **自动分块**（CLI 不分块会 FAIL） |
@@ -64,6 +66,7 @@ description: |
 | `gui` | 启动 GUI（FastAPI 后端 + Vue 前端） |
 | `mcp` | 启动 MCP server（stdio，供 Claude Code / 其他 MCP client 调用；本 plugin 自动拉起） |
 | `project-init` | 初始化项目配置（自动检测 IAR/Keil、MCU、COM 口） |
+| `mcu-detect` | 发现/固化未知 MCU profile 与 FLM（多候选需选择） |
 | `project-info` | 显示项目配置状态 |
 | `flash` | 一站式烧录（连接 → IDCODE → FLM → 烧录） |
 | `rtt` | 一站式 RTT 捕获（支持 `--visualize`） |
@@ -88,7 +91,7 @@ description: |
 | `systemview-report` | 采集并生成自包含 HTML 可视化分析报告（浏览器打开） |
 | `rtt-find <map>` | 从 MAP 文件查找 RTT 地址 |
 | `rtt_storage_mode=1` | 静态 RTT 编译（详见 [references/rtt-static-mode.md](references/rtt-static-mode.md)） |
-| `copy-flm` | 拷贝 FLM 到 MICROKEEN 磁盘（仅 Keil） |
+| `copy-flm` | 拷贝 profile/工程指定的 FLM 到 MICROKEEN 磁盘 |
 | `keil-parse` / `iar-parse` | 解析 Keil/IAR 工程文件 |
 | `discover` | 发现 MKLink 端口 |
 | `test --port COM6` | 测试连接 |

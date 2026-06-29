@@ -326,32 +326,56 @@ class Device:
     ) -> dict:
         self._require_connected()
 
+        ext = Path(firmware).suffix.lower()
+        if ext not in (".hex", ".bin"):
+            raise DeviceError(f"Unsupported firmware format: {ext}")
+
         # Resolve MCU profile: prefer self._mcu hint > config mcu_key > idcode match
         from mklink.profiles import load_mcu_profiles, match_mcu_by_idcode, match_mcu_by_device
         profiles = load_mcu_profiles()
         mcu_profile = None
+        resolved_key = None
+        cfg = {}
         if self._mcu_hint and self._mcu_hint in profiles:
             mcu_profile = profiles[self._mcu_hint]
+            resolved_key = self._mcu_hint
         if not mcu_profile and self._project_root:
             from mklink.project_config import load_config
             cfg = load_config(self._project_root) or {}
             cfg_mcu = cfg.get("mcu_key")
             if cfg_mcu and cfg_mcu in profiles:
                 mcu_profile = profiles[cfg_mcu]
+                resolved_key = cfg_mcu
+        elif self._project_root:
+            from mklink.project_config import load_config
+            cfg = load_config(self._project_root) or {}
         if not mcu_profile:
             mcu_profile = self._get_mcu_profile()
+        explicit_custom = self._mcu_hint == "custom" or cfg.get("mcu_key") == "custom"
+        if not mcu_profile and not explicit_custom:
+            raise DeviceError(
+                "Unknown MCU profile; run `python -m mklink mcu-detect` "
+                "or `python -m mklink project-init` before flashing"
+            )
 
         flash_base = "0x08000000"
         ram_base = "0x20000000"
+        is_hpm_profile = False
         if mcu_profile:
             flash_base = mcu_profile.get("flash_base", flash_base)
             ram_base = mcu_profile.get("ram_base", ram_base)
+            profile_key = str(resolved_key or "").lower()
+            profile_name = str(mcu_profile.get("name", "")).lower()
+            profile_prefix = str(mcu_profile.get("device_prefix", "")).lower()
+            is_hpm_profile = (
+                profile_key.startswith("hpm")
+                or "hpmicro" in profile_name
+                or profile_prefix.startswith("hpm")
+            )
 
         # Setup SWD clock (prefer config, fallback to profile default)
         swd_clock = 1000000
-        if self._project_root:
-            from mklink.project_config import load_config
-            cfg = load_config(self._project_root) or {}
+        if cfg:
             cfg_clock = cfg.get("swd_clock")
             if cfg_clock:
                 swd_clock = int(cfg_clock)
@@ -368,8 +392,16 @@ class Device:
         if flm_path:
             if not self._flash.load_flm(flm_path, flash_base, ram_base):
                 raise DeviceError(f"FLM load failed: {flm_path}")
+        elif (
+            mcu_profile
+            and resolved_key != "custom"
+            and not explicit_custom
+            and not is_hpm_profile
+        ):
+            raise DeviceError(
+                f"MCU profile {resolved_key or mcu_profile.get('name', '')!r} has no FLM path"
+            )
 
-        ext = Path(firmware).suffix.lower()
         if ext == ".hex":
             result = self._flash.burn_hex(
                 firmware, progress_callback=progress_callback
@@ -1006,13 +1038,24 @@ def discover_all() -> list[dict]:
     Returns a list of dicts, each with keys:
         port, description, manufacturer
     """
-    from mklink.discovery import list_available_ports
+    from mklink._types import KNOWN_MKLINK_VID_PIDS
+    from mklink.discovery import list_available_ports, _probe_port
     ports = list_available_ports()
-    return [
-        {
+    results: list[dict] = []
+    for p in ports:
+        mfr = (p.get("manufacturer") or "").lower()
+        desc = (p.get("description") or "").lower()
+        vid_pid = (p.get("vid"), p.get("pid"))
+        known_identity = (
+            any(kw in mfr for kw in ("microkeen", "microlink", "mklink"))
+            or any(kw in desc for kw in ("microkeen", "microlink", "mklink"))
+            or vid_pid in KNOWN_MKLINK_VID_PIDS
+        )
+        if not known_identity and not _probe_port(p["device"]):
+            continue
+        results.append({
             "port": p["device"],
             "description": p.get("description", ""),
             "manufacturer": p.get("manufacturer", ""),
-        }
-        for p in ports
-    ]
+        })
+    return results

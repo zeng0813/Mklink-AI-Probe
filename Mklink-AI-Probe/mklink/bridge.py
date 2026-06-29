@@ -8,6 +8,7 @@ MKLink Serial Bridge — 核心串口通信类。
 from __future__ import annotations
 
 import atexit
+import codecs
 import os
 import re
 import sys
@@ -151,6 +152,10 @@ class MKLinkSerialBridge:
         self._reader_thread: threading.Thread | None = None
         self._running = False
         self._response_buffer: list[str] = []
+        # 增量 UTF-8 解码器：把跨 read() 边界的不完整多字节序列（如中文 3 字节）
+        # 缓存到下次读取，避免每个 4096 字节块独立 decode 时半字符被替换成 �。
+        # 流会话边界（_enter_stream / _exit_stream / stop_stream）会 reset() 清空残留。
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._prompt_event = threading.Event()
         self._buffer_lock = threading.Lock()
         self._cmd_lock = threading.Lock()  # 命令级互斥，防止并发操作
@@ -366,6 +371,7 @@ class MKLinkSerialBridge:
         with self._buffer_lock:
             remaining = "".join(self._response_buffer)
             self._response_buffer.clear()
+        self._utf8_decoder.reset()  # 停止流：丢弃可能残留的半字符
         self._ctx.state = DeviceState.READY
         return remaining
 
@@ -433,6 +439,7 @@ class MKLinkSerialBridge:
         """切换到流模式（RTT/SystemView/VOFA）。清空缓冲区避免残留数据泄漏到流中。"""
         with self._buffer_lock:
             self._response_buffer.clear()
+        self._utf8_decoder.reset()  # 新流会话从干净状态开始
         self._ctx.state = state
 
     def _exit_stream(self) -> str:
@@ -444,6 +451,7 @@ class MKLinkSerialBridge:
             else:
                 remaining = "".join(parts)
             self._response_buffer.clear()
+        self._utf8_decoder.reset()  # 退出流：丢弃可能残留的半字符
         self._ctx.state = DeviceState.READY
         return remaining
 
@@ -510,9 +518,6 @@ class MKLinkSerialBridge:
             if not data:
                 continue
 
-            text = data.decode("utf-8", errors="replace")
-            line_buf += text
-
             # 流模式下不检测 >>>（RTT/SystemView/VOFA 数据可能包含 >>>）
             is_stream = self._ctx.state in (
                 DeviceState.RTT_STREAM,
@@ -527,17 +532,23 @@ class MKLinkSerialBridge:
                     DeviceState.DUMP_STREAM,
                     DeviceState.SYSTEMVIEW_STREAM,
                 ):
-                    # VOFA/DumpMem/SystemView 二进制流：直接存 bytes，不 decode
+                    # VOFA/DumpMem/SystemView 二进制流：直接存 bytes，不 decode；
+                    # 同时清空文本解码器残留，避免 text→binary→text 切换污染
+                    self._utf8_decoder.reset()
                     with self._buffer_lock:
                         self._response_buffer.append(data)
                 else:
-                    # RTT 文本流：存 str
+                    # RTT 文本流：增量 UTF-8 解码（缓存跨 read 边界的半字符），存 str
+                    text = self._utf8_decoder.decode(data, final=False)
                     with self._buffer_lock:
                         self._response_buffer.append(text)
                 line_buf = ""
                 continue
 
-            # 命令模式：检测 >>> 提示符
+            # 命令模式：增量 UTF-8 解码后检测 >>> 提示符
+            text = self._utf8_decoder.decode(data, final=False)
+            line_buf += text
+
             if PROMPT in line_buf:
                 idx = line_buf.index(PROMPT)
                 before = line_buf[:idx]

@@ -442,6 +442,33 @@ def create_app(
                 "error": str(e),
             }
 
+    @app.post("/api/mcu-detect")
+    async def mcu_detect(body: dict = Body(default={})):
+        """Detect/create an MCU profile and resolve/copy its FLM file."""
+        from mklink.mcu_detect import detect_mcu_profile
+
+        loop = asyncio.get_event_loop()
+        project_root = _state["project_root"]
+        device = body.get("device")
+        flm = body.get("flm")
+        port = body.get("port")
+        write_profile = bool(body.get("write_profile", True))
+        copy_flm = bool(body.get("copy_flm", True))
+        read_idcode = bool(body.get("read_idcode", bool(port)))
+
+        return await loop.run_in_executor(
+            None,
+            lambda: detect_mcu_profile(
+                project_root=project_root,
+                device=device,
+                flm=flm,
+                port=port,
+                write_profile=write_profile,
+                copy_flm=copy_flm,
+                read_idcode=read_idcode,
+            ),
+        )
+
     # ===================================================================
     # REST API — Device Discovery
     # ===================================================================

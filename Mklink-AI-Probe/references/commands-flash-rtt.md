@@ -209,17 +209,29 @@ python -m mklink rtt --visualize --port-http 8888 --no-browser
 
 ### MICROKEEN 磁盘管理
 
-#### `python -m mklink copy-flm`
-自动将项目对应的 FLM 文件从 Keil 安装目录拷贝到 MICROKEEN 磁盘的 FLM 目录。
+#### `python -m mklink mcu-detect [--device STM32H723ZETx] [--flm CMSIS/Flash/xxx.FLM] [--json]`
+发现并固化未知 MCU 的 profile 与 FLM。适用于项目解析出的 MCU 不在 `mklink/mcu_profiles.json` 的情况。
 
-**仅适用于 Keil 项目**。IAR 项目使用内置 .board flash loader，不需要 FLM 文件。
+行为：
+1. 从工程 `project_info.json` 或 `--device` 获取 MCU 型号。
+2. 搜索本地 Keil/Arm Pack 的 `.pdsc`，只保留内部 Flash 算法（`start=0x08000000`），忽略 QSPI/OSPI/FMC/NOR/MMC 等外部算法。
+3. 若内部 FLM 唯一，自动写入 `mklink/mcu_profiles.json`（先备份 `.bak`）并复制 FLM 到 MICROKEEN `/FLM`。
+4. 若有多个内部候选，交互终端会提示编号选择；MCP/API/非交互 CLI 返回 `needs_selection` 和候选列表，必须用 `--flm`/`flm` 指定后重试。
+5. 若本地只有 `.pdsc` 索引但没有 FLM 文件，停止并提示安装或解包对应 Keil/Arm Pack。
+
+**禁止兜底规则：** 非 HPM 项目识别出新 MCU 时，不要把 `.mklink/config.json` 改成 `custom` 直接烧录。必须先 `mcu-detect` 成功固化 profile。
+
+#### `python -m mklink copy-flm`
+自动将项目/profile 对应的 FLM 文件从 Keil 安装目录或 Arm Pack 拷贝到 MICROKEEN 磁盘的 FLM 目录。
+
+如果项目 MCU 还没有 profile，先运行 `python -m mklink mcu-detect`。
 
 `project-init` 会自动执行此操作，通常不需要手动运行。
 
 ### 配置管理
 
 #### `python -m mklink project-init`
-初始化项目配置。自动检测 IAR/Keil 工程类型，解析对应工程文件、匹配 MCU、自动发现 COM 口、拷贝 FLM（仅 Keil）。
+初始化项目配置。自动检测 IAR/Keil 工程类型，解析对应工程文件、匹配 MCU、自动发现 COM 口、拷贝 FLM。若 MCU 未知，会先执行 MCU profile 发现；多内部 FLM 候选或本地 FLM 缺失时会停止并给出下一步提示。
 
 #### `python -m mklink project-info`
 显示当前项目配置状态（COM 口、MCU、IDE 类型、HEX/MAP 路径、RTT 配置等）。
@@ -238,6 +250,6 @@ python -m mklink rtt --visualize --port-http 8888 --no-browser
 - `config.json` — COM 口、MCU 类型、IDE 类型
 - `project_info.json` — HEX/MAP/OUT 文件路径（IDE-agnostic）
 - `rtt_config.json` — RTT 地址
-- MICROKEEN 磁盘 FLM 文件（仅 Keil 需要）
+- MICROKEEN 磁盘 FLM 文件（profile 指定时需要）
 
 如果配置缺失或无效，会提示运行 `python -m mklink project-init`。

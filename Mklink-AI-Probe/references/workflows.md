@@ -48,8 +48,9 @@ python -m mklink rtt
 |------|----------|
 | COM 口不存在 | `python -m mklink discover` 查找端口 |
 | IDCODE 无效 | 检查 SWD 接线和目标板供电 |
-| FLM 加载失败（仅 Keil） | `python -m mklink copy-flm` 拷贝 FLM |
-| IAR 项目不需要 FLM | IAR 使用内置 .board flash loader，无需 FLM |
+| 新 MCU 未知 / profile 缺失 | `python -m mklink mcu-detect`，多候选时选择内部 Flash FLM 后固化 |
+| 找不到 H723/H7 等 FLM | 安装或解包对应 Keil/Arm Pack，再运行 `python -m mklink mcu-detect --flm <算法路径>` |
+| FLM 加载失败 | 先 `python -m mklink mcu-detect` 确认 profile/FLM，再 `python -m mklink copy-flm` 拷贝 FLM |
 | RTT 搜索失败 | 检查固件是否已集成 RTT 并重新编译 |
 | RTT 集成验证失败 | 确认 `main()` 在合适位置调用了 `SEGGER_RTT_Init()`（通常在系统初始化之后） |
 | 头文件目录不存在 | 检查项目的 Include Path 配置，使用 --inc-dir 指定正确路径 |

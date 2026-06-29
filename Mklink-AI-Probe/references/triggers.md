@@ -34,10 +34,11 @@
 | "烧录器版本" / "查看固件版本" / "MKLink 版本" / "MicroLink 版本" | `python -m mklink version`（默认仅当前版本；`--all` 看完整历史；`--raw` 看原始响应） |
 | "查看项目配置" | `python -m mklink project-info` |
 | "初始化项目" | `python -m mklink project-init` |
+| "新 MCU" / "未知 MCU" / "STM32H723" / "缺少 FLM" / "profile 不匹配" | `python -m mklink mcu-detect`；多内部 FLM 候选时先让用户选择，再用 `--flm` 固化 |
 | "解析 IAR 工程" / "查看 IAR 配置" | `python -m mklink iar-parse` |
 | "解析 Keil 工程" / "查看 Keil 配置" | `python -m mklink keil-parse` |
 | "集成 RTT（Keil/IAR）" | `python -m mklink rtt-integrate --project-root .` |
-| "拷贝 FLM（Keil）" | `python -m mklink copy-flm` |
+| "拷贝 FLM" | 先确认 profile 已存在；必要时 `python -m mklink mcu-detect`，再 `python -m mklink copy-flm` |
 
 
 ## Modbus

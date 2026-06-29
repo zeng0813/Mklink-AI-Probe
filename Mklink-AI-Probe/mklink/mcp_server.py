@@ -196,7 +196,10 @@ def _register_connection_tools(mcp: Any) -> None:
             # AXF was requested but symbols didn't load — surface the reason
             # (typically readelf missing) so the agent can guide the install
             # instead of the user hitting an opaque error on read_variable.
-            out["axf_error"] = getattr(dev, "_axf_error", None) or "unknown"
+            status = getattr(dev, "axf_status", {}) or {}
+            out["axf_error"] = (
+                status.get("error") if isinstance(status, dict) else None
+            ) or getattr(dev, "_axf_error", None) or "unknown"
             from mklink.toolchain import resolve_readelf
             out["readelf_available"] = bool(resolve_readelf())
         return out
@@ -231,6 +234,37 @@ def _register_connection_tools(mcp: Any) -> None:
             "state": str(dev.state),
             "axf_loaded": bool(getattr(dev, "_dwarf_info", None)),
         }
+
+
+def _register_project_tools(mcp: Any) -> None:
+    @mcp.tool()
+    def detect_mcu_profile(
+        project_root: str = ".",
+        device: str | None = None,
+        port: str | None = None,
+        flm: str | None = None,
+        write_profile: bool = True,
+        copy_flm: bool = True,
+        read_idcode: bool = False,
+    ) -> dict:
+        """Detect or create an MCU profile and resolve its FLM.
+
+        Use before flashing a project whose MCU is not already present in
+        ``mcu_profiles.json``. If multiple internal FLM algorithms are found,
+        returns ``status=needs_selection`` with candidates; call again with
+        ``flm`` set to the selected algorithm path to persist it.
+        """
+        from mklink.mcu_detect import detect_mcu_profile as _detect
+
+        return _detect(
+            project_root=project_root,
+            device=device,
+            port=port,
+            flm=flm,
+            write_profile=write_profile,
+            copy_flm=copy_flm,
+            read_idcode=read_idcode,
+        )
 
 
 def _register_flash_tools(mcp: Any) -> None:
@@ -864,9 +898,24 @@ def _register_flush_tools(mcp: Any) -> None:
             writes: List of {"address": int, "data_hex": str}, e.g.
                 [{"address": 0x20002000, "data_hex": "DEADBEEF"}].
         """
-        dev = _connected_device()
         from mklink.cli import _parse_flush_response
-        parsed = [(int(w["address"]), _from_hex(w["data_hex"])) for w in writes]
+        parsed: list[tuple[int, bytes]] = []
+        for i, w in enumerate(writes):
+            if not isinstance(w, dict) or "address" not in w or "data_hex" not in w:
+                raise ValueError(f"writes[{i}] must contain address and data_hex")
+            try:
+                address = int(w["address"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"writes[{i}].address must be an integer") from exc
+            data_hex = w["data_hex"]
+            if not isinstance(data_hex, str):
+                raise ValueError(f"writes[{i}].data_hex must be a hex string")
+            try:
+                data = _from_hex(data_hex)
+            except ValueError as exc:
+                raise ValueError(f"writes[{i}].data_hex must be valid hex: {exc}") from exc
+            parsed.append((address, data))
+        dev = _connected_device()
         batches = _plan_flush_batches(parsed)
         results = []
         for bi, batch in enumerate(batches):
@@ -996,6 +1045,10 @@ def _register_modbus_tools(mcp: Any) -> None:
             function: 5=write single coil, 6=write single register (default),
                 15=write multiple coils, 16=write multiple registers.
         """
+        if function not in (5, 6, 15, 16):
+            raise ValueError("function must be 5/6/15/16 for writes")
+        if not values:
+            raise ValueError("values must contain at least one item")
         c = _get_modbus()
         if function == 5:
             c.write_coil(address, bool(values[0]), slave=slave)
@@ -1005,8 +1058,6 @@ def _register_modbus_tools(mcp: Any) -> None:
             c.write_coils(address, [bool(v) for v in values], slave=slave)
         elif function == 16:
             c.write_registers(address, [int(v) for v in values], slave=slave)
-        else:
-            raise ValueError("function must be 5/6/15/16 for writes")
         return {
             "function": function, "slave": slave,
             "address": address, "written": len(values),
@@ -1152,6 +1203,7 @@ def build_server() -> Any:
     mcp = FastMCP("mklink")
 
     _register_health_tools(mcp)
+    _register_project_tools(mcp)
     _register_connection_tools(mcp)
     _register_flash_tools(mcp)
     _register_memory_tools(mcp)

@@ -4,12 +4,12 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-04T08:48:01+08:00`
+- 更新时间：`2026-09-04T16:07:01+08:00`
 - 分支：`master`
 - HEAD：`master contains the SystemView session lifecycle fix, bounded first-session recovery, synchronized Web assets, and regression coverage.`
 - 远端 HEAD：`origin/master contains the validated SystemView session lifecycle fix; feature/eternal-chip-gui carries the corresponding source fix with its own branded Web assets.`
-- 工作树：Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory. The Linux probe-disk discovery fix is committed on branch fix/linux-probe-disk (not pushed) as of 2026-09-04.
-- 当前任务：补足 Linux/macOS 上的 MICROKEEN 探针 U 盘发现：POSIX 分支原先直接返回 None，导致 Debian 13 的 Web GUI 恒显示 MICROKEEN 未找到。已实现按卷标发现、新增 describe_microkeen_disk 诊断与 microkeen-disk CLI，并让 GUI 状态栏显示具体原因。
+- 工作树：Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory. The Linux probe-disk discovery fix is committed as bb33bc6 on branch fix/linux-probe-disk and pushed to origin on 2026-09-04; the branch tracks origin/fix/linux-probe-disk and is 0 ahead / 0 behind. No PR opened and nothing merged into master or dev yet.
+- 当前任务：补足 Linux/macOS 上的 MICROKEEN 探针 U 盘发现：POSIX 分支原先直接返回 None，导致 Debian 13 的 Web GUI 恒显示 MICROKEEN 未找到。已实现按卷标三级发现、新增 describe_microkeen_disk 诊断与只读 CLI microkeen-disk；用户可见的界面改动落在真实渲染路径脱机烧录视图 OfflineFlashView（U 盘未找到时提示运行 microkeen-disk 诊断），而非未被任何视图引用的状态栏死代码组件。
 - 状态：`v0.1.9-linux-probe-disk-fixed`
 
 ## 里程碑
@@ -53,7 +53,7 @@
 ## 下一动作
 
 1. 在 Debian 13 实机上运行 python -m mklink microkeen-disk，确认 U 盘发现与 reason 判定符合预期；未挂载时用 udisksctl mount 验证，并把真实输出作为证据补进验证报告，再决定是否把里程碑从 complete-awaiting-hil 改为 complete。
-2. 取得用户明确同意后再提交本次改动（discovery、cli、api、web_entry、gui/src 与 dist、references、README、SKILL），不要自行 commit 或 push。
+2. 分支已按用户指示推送；取得明确同意后再开 PR 并合并到 master，合并前建议先在 Debian 13 上 checkout 该分支完成实机验证。
 3. 另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。
 4. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。
 
@@ -66,7 +66,7 @@
 - HIL relay 插件仍有既有 runtime/拒绝探针证据缺口；不影响本次 MKLink 插件 11/11 自动化准入。
 - Linux/macOS 的 U 盘发现与诊断只有 Windows 主机上的单元测试，没有 Debian 13 实机证据；lsblk 输出格式、udisks2 挂载点布局和会话权限模型均待真机确认。
 - GUI 前端改动（OfflineFlashView 诊断提示）已过 Vitest 并已重新生产构建 gui/dist。GlobalConfigStatusBar 与 ProjectStatusCard 两个状态栏组件当前未被任何视图引用，属死代码，若将来启用需另行验证；Node 22 下 svTimeline 的 1 个失败为既有环境差异，非本次引入。
-- 本次全部改动尚未提交，也未推送远端；工作树处于 dirty 状态。
+- 改动已提交为 bb33bc6 并推送到 origin/fix/linux-probe-disk，但尚未开 PR、未合并到 master 或 dev；合并与后续 Release 仍需单独授权。
 
 ## 延续协议
 

@@ -69,4 +69,5 @@ description: 使用 MKLink/MicroLink 操作目标 MCU：固件烧录、内存与
 | 安装、更新、运行依赖故障 | [安装与更新](references/install.md) |
 | U 盘/桌面 HTML 快速入口 | [Web 入口](references/web-entry.md) |
 | Windows USB 端口名称 | [端口命名](references/windows-port-names.md) |
+| Linux/macOS 找不到探针 U 盘 | [Linux 探针 U 盘](references/linux-probe-disk.md) |
 | 复杂编排或故障排查 | [工作流](references/workflows.md) |

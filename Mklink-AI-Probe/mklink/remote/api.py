@@ -1434,14 +1434,11 @@ def create_app(
 
     @app.get("/api/microkeen")
     async def get_microkeen_info():
-        from mklink.discovery import find_microkeen_disk, get_microkeen_flm_path
-        disk = find_microkeen_disk()
-        flm_dir = get_microkeen_flm_path()
-        return {
-            "disk_path": disk,
-            "flm_dir": flm_dir,
-            "available": disk is not None,
-        }
+        from mklink.discovery import describe_microkeen_disk
+
+        # lsblk and mount scanning can block for seconds on hosts with slow
+        # removable media, so keep them off the event loop.
+        return await run_in_threadpool(describe_microkeen_disk)
 
     async def _upload_file_source(
         file: UploadFile,

@@ -3,3 +3,6 @@
 /Mklink-AI-Probe/release/
 /.worktrees/
 /.build/
+/.workbuddy/
+__pycache__/
+*.egg-info/

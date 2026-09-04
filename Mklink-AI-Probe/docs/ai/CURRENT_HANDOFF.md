@@ -4,13 +4,13 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-02T13:18:45+08:00`
+- 更新时间：`2026-09-04T08:48:01+08:00`
 - 分支：`master`
 - HEAD：`master contains the SystemView session lifecycle fix, bounded first-session recovery, synchronized Web assets, and regression coverage.`
 - 远端 HEAD：`origin/master contains the validated SystemView session lifecycle fix; feature/eternal-chip-gui carries the corresponding source fix with its own branded Web assets.`
-- 工作树：Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory.
-- 当前任务：SystemView WebGUI 会话生命周期、首会话单次有界恢复、状态可观测性、回归测试、真机 HIL 以及 master/立芯分支同步均已完成。
-- 状态：`v0.1.9-systemview-session-fixed`
+- 工作树：Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory. The Linux probe-disk discovery fix is committed on branch fix/linux-probe-disk (not pushed) as of 2026-09-04.
+- 当前任务：补足 Linux/macOS 上的 MICROKEEN 探针 U 盘发现：POSIX 分支原先直接返回 None，导致 Debian 13 的 Web GUI 恒显示 MICROKEEN 未找到。已实现按卷标发现、新增 describe_microkeen_disk 诊断与 microkeen-disk CLI，并让 GUI 状态栏显示具体原因。
+- 状态：`v0.1.9-linux-probe-disk-fixed`
 
 ## 里程碑
 
@@ -18,17 +18,18 @@
 - **隐私安全的内存可观测性** — `complete`。从两个备份分支一次性迁移 MCP 私有流、统一观测事件、内存 dump/RTT/SystemView 发布和测试；保留 0.1.9 的 32 位地址、4 KiB 直读、8 区域批写、12 KiB flush 与写后校验边界。
 - **PR #15 本地集成门禁** — `complete`。Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。
 - **SystemView 会话生命周期修复** — `complete`。分离 duration 与单调时钟 idle watchdog，容忍瞬态读取，按设备连接代次仅为第一个会话提供一次自动恢复；重试时清理解析器、历史、统计、任务与 CPU hint，并在 WebGUI 显示恢复代次、原因和停止错误。
+- **Linux 探针 U 盘发现** — `complete-awaiting-hil`。find_microkeen_disk() 原先在非 Windows 直接返回 None，Debian 13 的 Web GUI 因此恒显示 MICROKEEN 未找到。现按 MKLINK_MICROKEEN_DISK、lsblk 卷标匹配和常见挂载根三级发现，优先返回可写目录；新增 describe_microkeen_disk() 与只读 CLI microkeen-disk，/api/microkeen 额外返回 platform、reason、writable、candidates 和 mounted_volumes；脱机烧录视图（OfflineFlashView）在 U 盘未找到时提示用户运行 microkeen-disk 诊断。注意 GlobalConfigStatusBar 与 ProjectStatusCard 两个状态栏组件当前未被任何视图引用，属死代码，不在实际 UI 渲染，故本轮不改动它们。web_entry 的 Linux 分支改为复用同一发现逻辑，消除两处分叉。
 
 ## 验证证据
 
 - **Python**：最终全量 1805 passed, 1 skipped，耗时 657.28 秒；SystemView 状态机定向回归 15 passed。Windows 默认 GBK 会使发布清单夹具解码 Git UTF-8 内容失败，使用明确的 PYTHONUTF8=1 后定向与全量均通过。
-- **GUI 与 Web**：Vitest 59 files / 627 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 连接 STM32F411CE 目标验证 SystemView 持续约 70 秒达到 260744 events、Sync Ready，浏览器零 error/零 warning，停止、断连和进程退出正常。
+- **GUI 与 Web 真机**：Vitest 59 files / 627 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 连接 STM32F411CE 目标验证 SystemView 持续约 70 秒达到 260744 events、Sync Ready，浏览器零 error/零 warning，停止、断连和进程退出正常。原生 CLI 在 COM5、channel 1、RTT 控制块 0x20010d40 上同样持续输出有效事件；故障故事中的首会话自动恢复实测曾持续 80 秒达到 165967 events 且零错误。
 - **Go/STCP**：官方 Go 1.25.12 工具链下 go test ./... 通过；当前源码 DLL SHA-256=C49908A030D16629253683C7B3B4837673863081E4602D8A1F25B54AA0B79087。
 - **Tauri Release 可执行文件**：Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，16.3 MB EXE SHA-256=86D3F036D828699737610C0AB7A1129D04431F47234236C804A6A2401355D072。
 - **HIL-Infra 硬门禁**：contract_check 61 symbols / SHA 0347576fb2dd8c02...；pytest 380 passed；6 个 capmap 静态一致性零错误零豁免；bench-01、bench-gec1900、运行计划和资源映射通过。
 - **HIL 运行时与插件准入**：MKLink runtime 拒绝探针与自动化插件评审 11/11 OK；run-verify RV-01..RV-10 全部 OK，run-doctor 零孤儿、结束后无活动锁。本轮未烧录目标、未执行 OTA、未改变供电或发送 CAN。
-- **SystemView 真机链路**：原生 CLI 在 COM5、channel 1、RTT 控制块 0x20010d40 上运行 10 秒并持续输出有效事件；最终生产 WebGUI 会话约 70 秒达到 260744 events。既有故障故事中的首会话自动恢复实测曾持续 80 秒达到 165967 events 且零错误。
 - **PR #15 固件资产**：按用户决策采用 PR 文件：HPMLink V4.3.8 SHA-256=D295858F3914998ABB7A19F6064157F6695C5B43E362CB00553D7A295A7E3FA8；MicroLink V3.3.8 SHA-256=E213B248A137C6519A9E926EAAC78718CE844C2A20555F3A3D2A48581B099BE8；MicroLink V4.3.9 SHA-256=F29821A6A34B75F3DAE96416595CA572A2DACAAF54C9DCC17521845F212DCEF6。
+- **Linux U 盘发现**：Windows 主机上 test_discovery 23 passed（6 个 POSIX 发现场景 + 5 个诊断场景）、CLI/API 批量 222 passed、test_offline_download 35 passed；全量 pytest 与干净基线 ddecf96 逐项一致，14 failed / 3 errors 全为本机既有环境失败（fastmcp schema 差异、pyinstaller 打包、WebSocket 时序），其中一次出现 15 failed 属 flaky，回归对比须核对用例名而非总数。实机未验证：POSIX 分支只有单元测试，lsblk 输出格式、udisks2 挂载点与权限模型有待 Debian 13 真机确认，GUI 改动（OfflineFlashView 在 U 盘未找到时提示运行 microkeen-disk 诊断）已通过 Vitest 59 files / 627 tests 并完成生产构建同步 gui/dist；须用 Node 24，Node 22 下 svTimeline 有 1 个既有数值/时序失败，与本次改动无关。
 
 ## 架构决策
 
@@ -39,6 +40,9 @@
 - 构建、测试、日志和缓存统一位于 MKLINK_BUILD_ROOT 或主工作区忽略的 .build，并经 scripts/build_workspace.ps1 运行。
 - 实际烧录、复位、供电、CAN 发送等不可逆或有外部影响的动作必须获得针对本次操作的明确确认。
 - 应用 Release、标签、更新签名和探针固件发布彼此独立，不随 PR 合并自动执行。
+- POSIX 上的探针 U 盘发现按 MKLINK_MICROKEEN_DISK、lsblk 卷标匹配、常见挂载根扫描三级进行并优先返回可写目录；挂载根用 SUDO_USER/USER 而非家目录名，使 sudo 与 systemd 会话也能命中 udisks2 挂在登录用户名下的卷。不得退回单一硬编码路径的实现。
+- U 盘发现失败必须返回可诊断的 reason、候选路径与已挂载卷，界面上不得只暴露裸的 'MICROKEEN 未找到'。
+- 未做实机验证的平台分支在交接中标记为 complete-awaiting-hil，不得把单元测试通过写成跨平台 PASS。
 
 ## 真机环境
 
@@ -48,8 +52,10 @@
 
 ## 下一动作
 
-1. 另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。
-2. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。
+1. 在 Debian 13 实机上运行 python -m mklink microkeen-disk，确认 U 盘发现与 reason 判定符合预期；未挂载时用 udisksctl mount 验证，并把真实输出作为证据补进验证报告，再决定是否把里程碑从 complete-awaiting-hil 改为 complete。
+2. 取得用户明确同意后再提交本次改动（discovery、cli、api、web_entry、gui/src 与 dist、references、README、SKILL），不要自行 commit 或 push。
+3. 另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。
+4. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。
 
 ## 已知限制
 
@@ -58,6 +64,9 @@
 - Web 生产构建仍提示 DashboardView 压缩后约 551.11 KiB，超过 500 KiB 建议阈值，但不影响构建成功。
 - 探针冷启动后曾出现每次 SystemView start 都复位或停流的独立固件状态，增加到多次主机重试仍不能恢复；本次主机修复保持一次有界恢复，不掩盖该固件问题。经原生 CLI 正向控制后，同一目标的最终生产 WebGUI 长流验证通过。
 - HIL relay 插件仍有既有 runtime/拒绝探针证据缺口；不影响本次 MKLink 插件 11/11 自动化准入。
+- Linux/macOS 的 U 盘发现与诊断只有 Windows 主机上的单元测试，没有 Debian 13 实机证据；lsblk 输出格式、udisks2 挂载点布局和会话权限模型均待真机确认。
+- GUI 前端改动（OfflineFlashView 诊断提示）已过 Vitest 并已重新生产构建 gui/dist。GlobalConfigStatusBar 与 ProjectStatusCard 两个状态栏组件当前未被任何视图引用，属死代码，若将来启用需另行验证；Node 22 下 svTimeline 的 1 个失败为既有环境差异，非本次引入。
+- 本次全部改动尚未提交，也未推送远端；工作树处于 dirty 状态。
 
 ## 延续协议
 

@@ -795,6 +795,47 @@ def _cli_systemview(
         print(f"\n[OK] SystemView 会话结束")
 
 
+_MICROKEEN_REASON_HINTS = {
+    "found": "已找到 MICROKEEN 卷。",
+    "read-only": "卷已挂载但不可写，脱机烧录会在写入阶段失败；"
+                 "检查挂载参数 uid/gid/umask。",
+    "no-access": "候选路径存在但既不可写也不可读，检查挂载点权限。",
+    "no-mount": "未挂载，或卷标不是 MICROKEEN。"
+                "用 udisksctl mount -b /dev/sdX1 挂载，"
+                "或设置 MKLINK_MICROKEEN_DISK 指向挂载点。",
+    "configured-root": "使用 MKLINK_MICROKEEN_DISK 指定的路径。",
+    "configured-root-missing": "MKLINK_MICROKEEN_DISK 指向的目录不存在。",
+    "not-found": "未找到卷标为 MICROKEEN 的可移动磁盘。",
+}
+
+
+def _cli_microkeen_disk() -> None:
+    """报告 MICROKEEN U 盘的发现结果与原因。"""
+    from mklink.discovery import describe_microkeen_disk
+
+    report = describe_microkeen_disk()
+    reason = str(report.get("reason") or "")
+    disk = report.get("disk_path")
+
+    print(f"平台: {report.get('platform')}")
+    print(f"MICROKEEN 磁盘: {disk or '未找到'}")
+    print(f"可写: {'是' if report.get('writable') else '否'}")
+    print(f"FLM 目录: {report.get('flm_dir') or '无'}")
+    print(f"原因: {reason or 'unknown'} — {_MICROKEEN_REASON_HINTS.get(reason, '')}".rstrip())
+
+    candidates = report.get("candidates") or []
+    if candidates:
+        print("已检查的候选路径:")
+        for path in candidates:
+            print(f"  - {path}")
+
+    mounted = report.get("mounted_volumes") or []
+    if mounted:
+        print("lsblk 报告的挂载点:")
+        for path in mounted:
+            print(f"  - {path}")
+
+
 def _cli_copy_flm(project_root: str):
     """拷贝 FLM 文件到 MICROKEEN 磁盘。"""
     from mklink.project_config import load_config, load_project_info
@@ -3945,6 +3986,12 @@ def main():
         help="SystemView 源文件存放目录（默认 segger_systemview）",
     )
 
+    # microkeen-disk 子命令（U 盘发现诊断，只读）
+    subparsers.add_parser(
+        "microkeen-disk",
+        help="诊断 MICROKEEN U 盘是否被发现，未找到时给出原因",
+    )
+
     # copy-flm 子命令
     copy_flm_parser = subparsers.add_parser("copy-flm", help="拷贝 FLM 文件到 MICROKEEN 磁盘")
     _add_project_root_arg(copy_flm_parser)
@@ -4559,6 +4606,8 @@ def main():
         )
     elif args.command == "systemview-integrate":
         _cli_systemview_integrate(_resolve_project_root(args), sv_dir=args.sv_dir)
+    elif args.command == "microkeen-disk":
+        _cli_microkeen_disk()
     elif args.command == "copy-flm":
         _cli_copy_flm(_resolve_project_root(args))
     elif args.command == "flash":

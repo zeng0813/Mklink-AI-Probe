@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 from mklink import discovery
@@ -327,3 +328,152 @@ def test_microkeen_disk_accepts_only_a_label_verified_configured_root(monkeypatc
 
     monkeypatch.setattr(discovery, "_windows_volume_label", lambda _path: "OTHER")
     assert discovery.find_microkeen_disk() is None
+
+
+def _posix_discovery(monkeypatch, *, lsblk=None, roots=None):
+    monkeypatch.setattr(discovery.os, "name", "posix")
+    monkeypatch.setattr(discovery, "_mount_points_from_lsblk", lambda: lsblk or [])
+    monkeypatch.setattr(discovery, "_posix_mount_roots", lambda: roots or [])
+
+
+def test_microkeen_disk_posix_matches_lsblk_label(monkeypatch, tmp_path):
+    mount = tmp_path / "probe-volume"
+    mount.mkdir()
+    _posix_discovery(
+        monkeypatch,
+        lsblk=[("microkeen", str(mount)), ("OTHERDATA", str(tmp_path))],
+    )
+
+    assert discovery.find_microkeen_disk() == str(mount)
+
+
+def test_microkeen_disk_posix_scans_mount_roots(monkeypatch, tmp_path):
+    base = tmp_path / "media" / "dev"
+    mount = base / "MICROKEEN"
+    mount.mkdir(parents=True)
+    _posix_discovery(monkeypatch, roots=[str(base)])
+
+    assert discovery.find_microkeen_disk() == str(mount)
+
+
+def test_microkeen_disk_posix_accepts_configured_root(monkeypatch, tmp_path):
+    mount = tmp_path / "manual"
+    mount.mkdir()
+    _posix_discovery(monkeypatch, roots=[])
+    monkeypatch.setenv("MKLINK_MICROKEEN_DISK", str(mount) + "/")
+
+    assert discovery.find_microkeen_disk() == str(mount)
+
+
+def test_microkeen_disk_posix_returns_none_without_matches(monkeypatch):
+    _posix_discovery(monkeypatch)
+    monkeypatch.delenv("MKLINK_MICROKEEN_DISK", raising=False)
+
+    assert discovery.find_microkeen_disk() is None
+
+
+def test_lsblk_mount_points_flatten_nested_children():
+    payload = {
+        "blockdevices": [
+            {
+                "label": "MICROKEEN",
+                "mountpoint": "/media/dev/MICROKEEN",
+                "children": [
+                    {"label": "", "mountpoint": None},
+                ],
+            },
+            {"label": "root", "mountpoint": "/"},
+        ]
+    }
+
+    assert discovery._lsblk_mount_points(payload["blockdevices"]) == [
+        ("MICROKEEN", "/media/dev/MICROKEEN"),
+        ("root", "/"),
+    ]
+
+
+def test_first_usable_mount_prefers_writable_over_readonly(monkeypatch, tmp_path):
+    writable = tmp_path / "writable"
+    readonly = tmp_path / "readonly"
+    writable.mkdir()
+    readonly.mkdir()
+    def fake_access(path, mode):
+        root = str(path).rstrip("/")
+        if root == str(writable):
+            return True
+        if root == str(readonly):
+            return not (mode & os.W_OK)
+        return False
+
+    monkeypatch.setattr(discovery.os, "access", fake_access)
+
+    assert discovery._first_usable_mount([str(readonly), str(writable)]) == str(
+        writable
+    )
+    assert discovery._first_usable_mount([str(readonly)]) == str(readonly)
+    assert discovery._first_usable_mount([]) is None
+
+
+def test_describe_microkeen_disk_reports_found_volume(monkeypatch, tmp_path):
+    mount = tmp_path / "MICROKEEN"
+    flm = mount / "FLM"
+    flm.mkdir(parents=True)
+    _posix_discovery(monkeypatch, lsblk=[("MICROKEEN", str(mount))])
+
+    report = discovery.describe_microkeen_disk()
+
+    assert report["platform"] == "posix"
+    assert report["available"] is True
+    assert report["reason"] == "found"
+    assert report["disk_path"] == str(mount)
+    assert report["flm_dir"] == str(flm)
+    assert report["writable"] is True
+    assert report["candidates"] == [str(mount)]
+    assert report["mounted_volumes"] == [str(mount)]
+
+
+def test_describe_microkeen_disk_reports_no_mount(monkeypatch):
+    _posix_discovery(monkeypatch)
+    monkeypatch.delenv("MKLINK_MICROKEEN_DISK", raising=False)
+
+    report = discovery.describe_microkeen_disk()
+
+    assert report["available"] is False
+    assert report["reason"] == "no-mount"
+    assert report["candidates"] == []
+
+
+def test_describe_microkeen_disk_reports_configured_root_missing(monkeypatch, tmp_path):
+    _posix_discovery(monkeypatch)
+    monkeypatch.setenv("MKLINK_MICROKEEN_DISK", str(tmp_path / "absent"))
+
+    report = discovery.describe_microkeen_disk()
+
+    assert report["available"] is False
+    assert report["reason"] == "configured-root-missing"
+
+
+def test_describe_microkeen_disk_reports_read_only_volume(monkeypatch, tmp_path):
+    mount = tmp_path / "MICROKEEN"
+    mount.mkdir()
+    _posix_discovery(monkeypatch, lsblk=[("MICROKEEN", str(mount))])
+    monkeypatch.setattr(
+        discovery.os, "access", lambda path, mode: not (mode & os.W_OK)
+    )
+
+    report = discovery.describe_microkeen_disk()
+
+    assert report["available"] is True
+    assert report["reason"] == "read-only"
+    assert report["writable"] is False
+
+
+def test_describe_microkeen_disk_windows_reports_not_found(monkeypatch):
+    monkeypatch.setattr(discovery.os, "name", "nt")
+    monkeypatch.setattr(discovery, "_find_microkeen_disk_windows", lambda: None)
+    monkeypatch.delenv("MKLINK_MICROKEEN_DISK", raising=False)
+
+    report = discovery.describe_microkeen_disk()
+
+    assert report["platform"] == "windows"
+    assert report["reason"] == "not-found"

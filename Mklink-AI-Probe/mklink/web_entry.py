@@ -417,10 +417,10 @@ def find_microkeen_disks(
     elif system == "Darwin":
         candidates = [Path("/Volumes/MICROKEEN")]
     elif system == "Linux":
-        candidates = [
-            Path("/media") / home.name / "MICROKEEN",
-            Path("/run/media") / home.name / "MICROKEEN",
-        ]
+        from mklink.discovery import find_microkeen_disk
+
+        discovered = find_microkeen_disk()
+        candidates = [Path(discovered)] if discovered else []
     return [path for path in candidates if path.is_dir() and os.access(path, os.W_OK)]
 
 

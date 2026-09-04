@@ -177,7 +177,7 @@ function setError(value: unknown): void {
   }
   if (/MICROKEEN disk is unavailable/i.test(raw)) {
     errorTitle.value = tr('未找到脱机下载器 U 盘', 'Offline probe USB drive not found')
-    errorDetail.value = tr('请插入下载器 U 盘后刷新状态，再重新部署。', 'Insert the probe USB drive, refresh its status, and deploy again.')
+    errorDetail.value = tr('请插入下载器 U 盘后刷新状态，再重新部署；仍找不到时可在终端运行 python -m mklink microkeen-disk 诊断原因。', 'Insert the probe USB drive, refresh its status, and deploy again. If still missing, run python -m mklink microkeen-disk in a terminal to diagnose.')
     return
   }
   if (/missing firmware source|firmware source is unavailable/i.test(raw)) {

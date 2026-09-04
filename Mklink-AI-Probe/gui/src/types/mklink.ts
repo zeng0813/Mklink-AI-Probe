@@ -78,6 +78,11 @@ export interface MicrokeenInfo {
   disk_path: string | null
   flm_dir: string | null
   available: boolean
+  platform?: string
+  writable?: boolean
+  reason?: string | null
+  candidates?: string[]
+  mounted_volumes?: string[]
 }
 
 export interface ConnectRequest {

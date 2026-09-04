@@ -240,6 +240,7 @@ python -m mklink flush-memory "0x20008000:0xAA*4096" --verify
 | `modbus` / `serial` | Modbus RTU 与通用串口调试 |
 | `halt` / `resume` / `step` / `break` | CPU 运行控制与断点 |
 | `resources` | 查看或释放本地资源占用 |
+| `microkeen-disk` | 诊断探针 U 盘发现结果，未找到时给出原因 |
 | `discover` / `test` / `version` | 发现探针、连接测试和版本查询 |
 
 完整命令文档见 [references 目录](Mklink-AI-Probe/references/)。

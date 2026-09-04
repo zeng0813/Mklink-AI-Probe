@@ -7,7 +7,11 @@ MKLink Serial Bridge — COM 口发现和磁盘管理。
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+from pathlib import Path
+
 import serial
 from serial.tools import list_ports
 
@@ -239,14 +243,211 @@ def _windows_volume_label(root: str) -> str | None:
         return None
 
 
+def _posix_mount_roots() -> list[str]:
+    """Return POSIX candidate mount roots, user mounts first.
+
+    ``sudo`` sessions resolve ``Path.home()`` to ``/root`` while udisks2 keeps
+    the removable volume under ``/media/<login user>``, so the effective login
+    name is preferred over the home directory name.
+    """
+    home = Path.home()
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or home.name
+    roots: list[str] = []
+    for base in ("/media", "/run/media"):
+        roots.append(f"{base}/{user}")
+        if home.name and home.name != user:
+            roots.append(f"{base}/{home.name}")
+    roots.extend(("/media", "/run/media", "/mnt", "/Volumes"))
+    return roots
+
+
+def _lsblk_mount_points(nodes: object) -> list[tuple[str, str]]:
+    """Flatten ``lsblk --json`` block devices into (label, mountpoint) pairs."""
+    entries: list[tuple[str, str]] = []
+    if not isinstance(nodes, list):
+        return entries
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        mountpoint = str(node.get("mountpoint") or "")
+        if mountpoint:
+            entries.append((str(node.get("label") or ""), mountpoint))
+        entries.extend(_lsblk_mount_points(node.get("children")))
+    return entries
+
+
+def _mount_points_from_lsblk() -> list[tuple[str, str]]:
+    """Read (label, mountpoint) pairs from lsblk when it is available."""
+    try:
+        completed = subprocess.run(
+            ["lsblk", "--json", "--output", "LABEL,MOUNTPOINT"],
+            capture_output=True,
+            timeout=3.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    try:
+        payload = json.loads(completed.stdout.decode("utf-8", "replace"))
+    except (ValueError, UnicodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    return _lsblk_mount_points(payload.get("blockdevices"))
+
+
+def _first_usable_mount(candidates: list[str]) -> str | None:
+    """Return the first writable mount, falling back to a readable one."""
+    seen: set[str] = set()
+    readable: str | None = None
+    for raw in candidates:
+        if not raw:
+            continue
+        root = str(raw).rstrip("/")
+        key = root.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not os.path.isdir(root):
+            continue
+        if os.access(root, os.W_OK | os.X_OK):
+            return root
+        if readable is None and os.access(root, os.R_OK | os.X_OK):
+            readable = root
+    return readable
+
+
+def _posix_microkeen_candidates() -> list[str]:
+    """Collect every path where the MICROKEEN volume could be mounted."""
+    candidates: list[str] = []
+    wanted = _MICROKEEN_DISK_NAME.casefold()
+    for label, mountpoint in _mount_points_from_lsblk():
+        if label.casefold() == wanted:
+            candidates.append(mountpoint)
+
+    seen_roots: set[str] = set()
+    for base in _posix_mount_roots():
+        if base.casefold() in seen_roots:
+            continue
+        seen_roots.add(base.casefold())
+        candidates.append(os.path.join(base, _MICROKEEN_DISK_NAME))
+        try:
+            children = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in children:
+            if name.casefold() == wanted:
+                candidates.append(os.path.join(base, name))
+
+    return candidates
+
+
+def _find_microkeen_disk_posix() -> str | None:
+    """Find the MICROKEEN volume on Linux and macOS.
+
+    Desktop environments mount removable volumes under different roots, and
+    some sessions (headless, sudo, systemd) see no automounted volume at all.
+    Matching by filesystem label through lsblk is authoritative; scanning the
+    usual mount roots covers systems where lsblk is unavailable.
+    """
+    configured = os.environ.get("MKLINK_MICROKEEN_DISK", "").strip()
+    if configured:
+        root = configured.rstrip("/")
+        return root if os.path.isdir(root) else None
+
+    return _first_usable_mount(_posix_microkeen_candidates())
+
+
 def find_microkeen_disk() -> str | None:
     """查找 MICROKEEN 磁盘路径。
 
-    在 Windows 上查找名为 [MICROKEEN] 的可移动磁盘。
-    返回磁盘根路径，如 'D:\\'，未找到返回 None。
+    在 Windows 上查找名为 [MICROKEEN] 的可移动磁盘；在 Linux/macOS 上按卷标
+    匹配，并回退到常见挂载点。返回磁盘根路径，如 Windows 的 'D:\\' 或 Linux
+    的 '/media/user/MICROKEEN'，未找到返回 None。
+
+    自动发现无法确定挂载位置时，可用 MKLINK_MICROKEEN_DISK 指向挂载根目录。
     """
-    if os.name != "nt":
-        return None
+    if os.name == "nt":
+        return _find_microkeen_disk_windows()
+    return _find_microkeen_disk_posix()
+
+
+def _microkeen_report(
+    disk: str | None,
+    reason: str,
+    candidates: list[str],
+    mounted: list[str],
+) -> dict[str, object]:
+    flm_dir = None
+    if disk is not None:
+        candidate = os.path.join(disk, _FLM_DIR_NAME)
+        flm_dir = candidate if os.path.isdir(candidate) else None
+    return {
+        "platform": "windows" if os.name == "nt" else "posix",
+        "disk_path": disk,
+        "flm_dir": flm_dir,
+        "available": disk is not None,
+        "writable": bool(disk is not None and os.access(disk, os.W_OK)),
+        "reason": reason,
+        "candidates": [path for path in candidates if os.path.isdir(path)],
+        "mounted_volumes": mounted,
+    }
+
+
+def _describe_microkeen_posix() -> dict[str, object]:
+    """Explain why the MICROKEEN volume was or was not found on POSIX."""
+    configured = os.environ.get("MKLINK_MICROKEEN_DISK", "").strip()
+    if configured:
+        root = configured.rstrip("/")
+        reason = "configured-root" if os.path.isdir(root) else "configured-root-missing"
+        return _microkeen_report(
+            root if os.path.isdir(root) else None, reason, [root], []
+        )
+
+    mounts = _mount_points_from_lsblk()
+    candidates = _posix_microkeen_candidates()
+    disk = _first_usable_mount(candidates)
+    if disk is None:
+        reason = "no-mount" if not any(os.path.isdir(p) for p in candidates) else "no-access"
+    elif not os.access(disk, os.W_OK):
+        reason = "read-only"
+    else:
+        reason = "found"
+    return _microkeen_report(
+        disk, reason, candidates, [mountpoint for _label, mountpoint in mounts]
+    )
+
+
+def _describe_microkeen_windows() -> dict[str, object]:
+    disk = _find_microkeen_disk_windows()
+    configured = os.environ.get("MKLINK_MICROKEEN_DISK", "").strip()
+    return _microkeen_report(
+        disk,
+        "found" if disk is not None else "not-found",
+        [configured] if configured else [],
+        [],
+    )
+
+
+def describe_microkeen_disk() -> dict[str, object]:
+    """报告 MICROKEEN 磁盘的发现结果与原因。
+
+    除 find_microkeen_disk() 的结果外，额外给出 reason、检查过的候选路径和
+    lsblk 报告的全部挂载点，便于在没有桌面环境的 Linux 主机上判断是未挂载、
+    卷标不匹配还是权限不足。reason 取值：
+
+    found / read-only / no-access / no-mount /
+    configured-root / configured-root-missing / not-found
+    """
+    if os.name == "nt":
+        return _describe_microkeen_windows()
+    return _describe_microkeen_posix()
+
+
+def _find_microkeen_disk_windows() -> str | None:
+    """查找 Windows 上名为 [MICROKEEN] 的可移动磁盘。"""
 
     # Service and scheduled-task sessions can enumerate removable volumes
     # differently from an interactive shell.  An operator may provide a
